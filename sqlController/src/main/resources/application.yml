@@ -1,0 +1,29 @@
+server:
+  port: 8083
+spring:
+  datasource:
+    url: jdbc:mysql://${SQL_CONFIG_DB_HOST:192.168.0.227}:3306/${SQL_CONFIG_DB_NAME:sql-controller}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false
+    username: ${SQL_CONFIG_DB_USER:root}
+    password: ${SQL_CONFIG_DB_PASSWORD:123456}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      continue-on-error: true
+sql-controller:
+  encryption-key: ${SQL_ENCRYPTION_KEY:change-this-local-key-32-bytes}
+  execution-timeout-seconds: 300    # 查询类(及未分类)SQL 超时：SELECT/SHOW/DESC/WITH（2026-09-10 由 30 放宽到 300，与 DML 一致；注意元数据查询 executeRaw/count 也走此值）
+  dml-timeout-seconds: 300          # 写类(DML)超时：INSERT/UPDATE/DELETE/MERGE
+  ddl-timeout-seconds: 600          # 结构类(DDL)超时：CREATE/ALTER/DROP/TRUNCATE/RENAME（大表加列可达分钟级）
+  connection-test-timeout-seconds: 10
+  max-page-size: 100
+  default-page-size: 10
+  cors-origins: "*"
+  # SQL 编辑器联想数据源配置
+  autocomplete:
+    enabled: true
+    schema-source: 8          # 11.auto 自动取 `database_connection` 表第一条记录   2.固定 connectionId
+    schema-cache-seconds: 86400    # 结构元数据缓存 TTL：24h（联想 + 字段对比快照共用，可「强制重抓」绕过）
+    max-tables: 500               # 表数量上限
+    max-columns: 100               # 单表字段上限
