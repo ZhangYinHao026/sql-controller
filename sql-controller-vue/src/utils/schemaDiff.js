@@ -230,14 +230,18 @@ export function toMysqlType(f, table) {
  * @param table 表名
  * @param cols 基准库列（引擎列：{name,type,pk,notNull,comment,autoIncrement,default?}）
  * @param notes 可选，收集生成提示（类型转写/长度兜底等）；未传时提示以 SQL 注释形式置于语句前
+ * @param extra 可选 {indexes, comment}：基准库索引（引擎索引）与表注释 —— 一并还原为
+ *              `UNIQUE KEY/KEY` 与表级 `COMMENT='...'`（转换器会拆成 CREATE INDEX / COMMENT ON TABLE）
  * @returns CREATE TABLE 完整语句（列清单多行缩进；主键收集为表级 PRIMARY KEY）
  */
-export function genCreateTable(table, cols, notes) {
+export function genCreateTable(table, cols, notes, extra) {
   const defs = []
   const pks = []
   const hints = []
+  const colUpper = new Set()
   ;(cols || []).forEach(f => {
     if (!f || !f.name) return
+    colUpper.add(String(f.name).toUpperCase())
     const tt = toMysqlType(f, table)
     tt.hints.forEach(h => hints.push(h))
     let s = '  `' + f.name + '` ' + tt.type
@@ -251,13 +255,98 @@ export function genCreateTable(table, cols, notes) {
     defs.push(s)
   })
   if (pks.length) defs.push('  PRIMARY KEY (' + pks.join(', ') + ')')
+  // 索引/唯一约束：跳过主键（已由 PRIMARY KEY 表达）；引用未知列（表达式索引、函数索引）整条跳过并提示
+  ;((extra && extra.indexes) || []).forEach(ix => {
+    if (!ix || ix.primary || !ix.name) return
+    const cols2 = (ix.columns || []).filter(Boolean)
+    if (!cols2.length) return
+    const unknown = cols2.filter(c => !colUpper.has(String(c).toUpperCase()))
+    if (unknown.length) {
+      hints.push('索引 ' + ix.name + '：引用未知列 ' + unknown.map(c => '`' + c + '`').join('、')
+        + '（表达式索引/函数索引无法还原），已跳过，请在目标库手工创建')
+      return
+    }
+    defs.push('  ' + (ix.unique ? 'UNIQUE KEY ' : 'KEY ') + '`' + ix.name + '` ('
+      + cols2.map(c => '`' + c + '`').join(', ') + ')')
+  })
+  const tc = extra && extra.comment ? String(extra.comment).trim() : ''
   const head = 'CREATE TABLE `' + table + '` (\n'
   const body = defs.join(',\n')
-  const tail = '\n);'
+  const tail = (tc ? '\n) COMMENT=' + sqlStr(tc) : '\n)') + ';'
   const sql = head + body + tail
   if (notes) hints.forEach(h => notes.push(h))
   else if (hints.length) return hints.map(h => '-- ' + h).join('\n') + '\n' + sql
   return sql
+}
+
+/* ============================================================
+ * 索引 / 表注释（结构快照的 meta 层）
+ * 后端快照 IndexInfo：{name, columns[], unique, primary, type?}
+ * 比对语义：索引名两库常不同（达梦唯一约束索引名是 INDEX33611650、约束名才是 uk_xxx），
+ * 故按「唯一性 + 列序列」签名匹配，而非按名字。主键索引由列级 pk 表达，一律不参与生成。
+ * ============================================================ */
+
+/** 后端快照索引 → 引擎索引（列名为空/无列返回 null）。 */
+export function toEngineIndex(ix) {
+  if (!ix) return null
+  const cols = (ix.columns || []).map(c => String(c)).filter(Boolean)
+  if (!cols.length) return null
+  return {
+    name: ix.name || '',
+    columns: cols,
+    unique: !!ix.unique,
+    primary: !!ix.primary,
+    type: ix.type || undefined
+  }
+}
+
+/** 快照表索引清单 → 引擎索引数组（丢弃主键索引与无名索引，避免重复生成 PRIMARY / 无效语句）。 */
+export function toEngineIndexes(list) {
+  const out = []
+  ;(list || []).forEach(x => {
+    const ix = toEngineIndex(x)
+    if (ix && ix.name && !ix.primary && !/^PRIMARY$/i.test(ix.name)) out.push(ix)
+  })
+  return out
+}
+
+/** 索引语义签名：唯一性 + 列序列（忽略大小写、忽略索引名）——跨方言索引名常不同。 */
+export function ixSig(ix) {
+  if (!ix) return ''
+  return (ix.unique ? 'U:' : 'K:') + (ix.columns || []).map(c => String(c).toUpperCase()).join(',')
+}
+
+/**
+ * 索引差异（基准 L → 比对 R）：按签名匹配。
+ * @returns {{missing:Array, extra:Array, same:number}}
+ *   missing = 基准有、比对库无 → 可生成 CREATE INDEX 补丁
+ *   extra   = 比对库多出 → 默认不动，仅提示
+ */
+export function indexDiff(L, R) {
+  const l = L || [], r = R || []
+  const rSigs = new Set(r.map(ixSig))
+  const lSigs = new Set(l.map(ixSig))
+  const missing = l.filter(ix => !rSigs.has(ixSig(ix)))
+  const extra = r.filter(ix => !lSigs.has(ixSig(ix)))
+  return { missing, extra, same: l.length - missing.length }
+}
+
+/** 生成 MySQL 风格索引补丁：每索引一条 CREATE [UNIQUE] INDEX（执行时跨方言由后端转换器翻译）。 */
+export function genIndexStmts(indexes, table) {
+  return (indexes || [])
+    .filter(ix => ix && ix.name && (ix.columns || []).length)
+    .map(ix => 'CREATE ' + (ix.unique ? 'UNIQUE ' : '') + 'INDEX `' + ix.name + '` ON `' + table + '` ('
+      + ix.columns.map(c => '`' + c + '`').join(', ') + ');')
+}
+
+/** 表注释差异：空/空视为一致，仅一侧有值按缺失方向标记（忽略首尾空白）。 */
+export function commentDiff(baseComment, cmpComment) {
+  const b = String(baseComment == null ? '' : baseComment).trim()
+  const c = String(cmpComment == null ? '' : cmpComment).trim()
+  if (b === c) return { kind: 'same', base: b, cmp: c }
+  if (!b) return { kind: 'extra', base: b, cmp: c }   // 比对库有、基准无
+  if (!c) return { kind: 'add', base: b, cmp: c }     // 基准有、比对库缺 → 可补
+  return { kind: 'alt', base: b, cmp: c }
 }
 
 /** 列的展示元信息（Vue 模板用）：[{k:'type'|'pk'|'null'|'default'|'cmt', v:文本}]。 */

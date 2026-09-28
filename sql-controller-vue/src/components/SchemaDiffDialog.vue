@@ -14,7 +14,7 @@
  */
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from 'vue'
 import {api} from '../api'
-import {eqName, genCreateTable, indexCols, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, appendOrReplaceBlock} from '../utils/schemaDiff'
+import {eqName, genCreateTable, genIndexStmts, indexCols, indexDiff, commentDiff, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, toEngineIndexes, appendOrReplaceBlock} from '../utils/schemaDiff'
 import {typeLabel} from '../utils/dbRegistry'
 import ConfirmDialog from './ConfirmDialog.vue'
 import DiffPatchDialog from './DiffPatchDialog.vue'
@@ -75,6 +75,18 @@ const colIdxOf = (id, t) => {
   const lib = libs[id]
   const k = tableRealKey(id, t)
   return (lib && k && lib.cI && lib.cI.get(k)) || null
+}
+/** 取某库某表索引（引擎索引数组，主键项在快照落地时已剔除）；无快照/无表返回 []。 */
+const indexesOf = (id, t) => {
+  const lib = libs[id]
+  const k = tableRealKey(id, t)
+  return (lib && k && lib.ix && lib.ix[k]) || []
+}
+/** 取某库某表表注释（无则空串）。 */
+const commentOf = (id, t) => {
+  const lib = libs[id]
+  const k = tableRealKey(id, t)
+  return (lib && k && lib.cmt && lib.cmt[k]) || ''
 }
 
 const summaryText = computed(() => {
@@ -265,15 +277,20 @@ function applySnaps(snaps) {
       const tables = {}
       const tU = new Map()   // 大写表名 → 真实表名（eqName O(1) 定位）
       const cI = new Map()   // 真实表名 → indexCols 列索引
+      const ix = {}          // 真实表名 → 引擎索引数组（仅存有索引的表）
+      const cmt = {}         // 真实表名 → 表注释（仅存有注释的表）
       ;(s.tables || []).forEach(ti => {
         const cols = (ti.columns || []).map(toEngineCol)
         tables[ti.name] = cols
         tU.set(String(ti.name).toUpperCase(), ti.name)
         cI.set(ti.name, indexCols(cols))
+        const idx = toEngineIndexes(ti.indexes)
+        if (idx.length) ix[ti.name] = idx
+        if (ti.comment) cmt[ti.name] = ti.comment
       })
-      libs[key] = {id: s.connectionId, name: conn.regionName, dbType: conn.dbType, fetchedAt: s.fetchedAt, error: null, tables, tU, cI}
+      libs[key] = {id: s.connectionId, name: conn.regionName, dbType: conn.dbType, fetchedAt: s.fetchedAt, error: null, tables, tU, cI, ix, cmt}
     } else {
-      libs[key] = {id: s.connectionId, name: conn.regionName, dbType: s.dbType || conn.dbType, fetchedAt: null, error: s.error || '抓取失败', tables: {}, tU: new Map(), cI: new Map()}
+      libs[key] = {id: s.connectionId, name: conn.regionName, dbType: s.dbType || conn.dbType, fetchedAt: null, error: s.error || '抓取失败', tables: {}, tU: new Map(), cI: new Map(), ix: {}, cmt: {}}
     }
   })
 }
@@ -516,7 +533,8 @@ function genCreateBlock(cmpId, t) {
   const base = libName(diffBase.value), cmp = libName(cmpId)
   const cross = libTypeName(cmpId) !== 'mysql'
   const head = `-- 【${cmp}】缺整表建表 ← 基准 ${base} · 表 \`${t}\`（MySQL 风格${cross ? '，执行时自动转换 ' + typeLabel(libTypeName(cmpId)) + ' 方言' : ''}）`
-  return head + '\n' + genCreateTable(t, cols)
+  const extra = { indexes: indexesOf(diffBase.value, t), comment: commentOf(diffBase.value, t) }
+  return head + '\n' + genCreateTable(t, cols, null, extra)
 }
 /** 单张缺表 → 生成建表脚本并标记已应用（入该库待执行桶，不弹窗）。 */
 function genOneCreate(cmpId, t) {
@@ -639,6 +657,28 @@ function clearStatesOfTable(t) {
     if (p.length === 2 && eqName(p[1], t)) delete applied[k]
   }
 }
+/** 局部刷新：把一张表（列 + 索引 + 表注释）写入本地快照索引。 */
+function putLocalTable(lib, ti) {
+  const cols = (ti.columns || []).map(toEngineCol)
+  lib.tables[ti.name] = cols
+  lib.tU.set(String(ti.name).toUpperCase(), ti.name)
+  lib.cI.set(ti.name, indexCols(cols))
+  lib.ix = lib.ix || {}
+  lib.cmt = lib.cmt || {}
+  delete lib.ix[ti.name]
+  delete lib.cmt[ti.name]
+  const idx = toEngineIndexes(ti.indexes)
+  if (idx.length) lib.ix[ti.name] = idx
+  if (ti.comment) lib.cmt[ti.name] = ti.comment
+}
+/** 局部刷新：移除本地某表的所有条目（表被 DROP / 表名大小写变化）。 */
+function forgetLocalTable(lib, key) {
+  delete lib.tables[key]
+  lib.tU.delete(String(key).toUpperCase())
+  lib.cI.delete(key)
+  if (lib.ix) delete lib.ix[key]
+  if (lib.cmt) delete lib.cmt[key]
+}
 async function refreshTablesAfterExec(connId, sqlText) {
   const lib = connId != null ? libs[connId] : null
   if (!lib) return // 该库本会话未抓过快照（理论不发生：能生成补丁必有快照）
@@ -659,15 +699,12 @@ async function refreshTablesAfterExec(connId, sqlText) {
       const ti = returned.get(String(t).toUpperCase())
       const oldK = tableRealKey(connId, t)
       if (ti) {
-        if (oldK && oldK !== ti.name) { delete lib.tables[oldK]; lib.tU.delete(String(oldK).toUpperCase()); lib.cI.delete(oldK) }
-        const cols = (ti.columns || []).map(toEngineCol)
-        lib.tables[ti.name] = cols
-        lib.tU.set(String(ti.name).toUpperCase(), ti.name)
-        lib.cI.set(ti.name, indexCols(cols))
+        if (oldK && oldK !== ti.name) forgetLocalTable(lib, oldK)
+        putLocalTable(lib, ti)
         n++
       } else if (oldK) {
         // 后端已无此表（被 DROP）：移除本地条目，列表/徽章自然更新
-        delete lib.tables[oldK]; lib.tU.delete(String(oldK).toUpperCase()); lib.cI.delete(oldK)
+        forgetLocalTable(lib, oldK)
         n++
       }
       clearStatesOfTable(t)
@@ -775,6 +812,89 @@ const detailStat = computed(() => {
 const detailCreateDone = computed(() =>
   detailMissingTable.value && !!applied[diffCmp.value + '|' + diffTable.value]
 )
+
+/* ---- 索引 / 表注释差异（单表核对视图） ----
+ * 与列差异并列展示：索引按「唯一性 + 列序列」签名比对（跨方言索引名常不同），
+ * 主键索引已在快照落地时剔除（由列级 pk 表达，不重复生成）。
+ * 生成方向统一为「对齐基准」：仅补目标库缺失的索引 + 表注释，目标多出的只提示不删。 */
+const detailIndexDiff = computed(() => {
+  const empty = { missing: [], extra: [], same: 0, base: [], cmp: [] }
+  if (!detailReady.value || !diffTable.value) return empty
+  const t = diffTable.value
+  const base = indexesOf(diffBase.value, t)
+  const cmp = detailMissingTable.value ? [] : indexesOf(diffCmp.value, t)
+  const d = indexDiff(base, cmp)
+  return { missing: d.missing, extra: d.extra, same: d.same, base, cmp }
+})
+const detailCommentDiff = computed(() => {
+  if (!detailReady.value || !diffTable.value) return { kind: 'same', base: '', cmp: '' }
+  const t = diffTable.value
+  return commentDiff(commentOf(diffBase.value, t), detailMissingTable.value ? '' : commentOf(diffCmp.value, t))
+})
+/** 索引差异展示视图（模板只读）：两个方向的行 + 计数，避免模板里做逻辑。 */
+const detailIndexView = computed(() => {
+  const d = detailIndexDiff.value
+  const row = ix => ({
+    name: ix.name || '(无名)',
+    type: ix.type || '',
+    cols: (ix.columns || []).join(', '),
+    unique: !!ix.unique
+  })
+  const cd = detailCommentDiff.value
+  return {
+    missing: d.missing.map(row),
+    extra: d.extra.map(row),
+    same: d.same,
+    baseCount: d.base.length,
+    cmpCount: d.cmp.length,
+    comment: {
+      kind: cd.kind,
+      base: cd.base,
+      cmp: cd.cmp,
+      txt: { same: '', add: '基准有、目标缺 → 可补', extra: '目标有、基准无', alt: '两侧不同 → 可对齐基准' }[cd.kind] || ''
+    }
+  }
+})
+/** 该表是否有可生成的索引/注释补丁（模板按钮禁用态）。 */
+const detailMetaActionable = computed(() => {
+  if (!detailReady.value || !diffTable.value || detailMissingTable.value) return false
+  const cd = detailCommentDiff.value
+  return detailIndexDiff.value.missing.length > 0 || cd.kind === 'add' || cd.kind === 'alt'
+})
+/** 生成索引/表注释补丁入该库待执行桶（缺整表时改为提示用建表脚本，索引注释随建表一并还原）。 */
+function genMetaPatch(cmpId, t) {
+  if (cmpId == null || !t) return
+  if (!hasTbl(cmpId, t)) {
+    return toast(`比对库缺整表 \`${t}\`：请用「建表脚本」生成，索引与表注释会随之还原`)
+  }
+  const d = indexDiff(indexesOf(diffBase.value, t), indexesOf(cmpId, t))
+  const cd = commentDiff(commentOf(diffBase.value, t), commentOf(cmpId, t))
+  const stmts = genIndexStmts(d.missing, t)
+  const notes = []
+  if (d.extra.length) {
+    notes.push('目标多出 ' + d.extra.length + ' 个索引（' + d.extra.map(x => x.name).join('、') + '），默认不删，请人工评估')
+  }
+  if (cd.kind === 'add') {
+    stmts.push(commentStmt(cmpId, t, cd.base))
+  } else if (cd.kind === 'alt') {
+    stmts.push(commentStmt(cmpId, t, cd.base))
+    notes.push('表注释将按基准库覆盖（目标现为「' + cd.cmp + '」）')
+  } else if (cd.kind === 'extra') {
+    notes.push('目标表注释（' + cd.cmp + '）基准库没有，默认不动')
+  }
+  if (!stmts.length) {
+    return toast(`\`${t}\` 索引与表注释无待补项` + (notes.length ? '：' + notes[0] : ''))
+  }
+  const head = `-- 【${libName(cmpId)}】索引/表注释 ← 基准 ${libName(diffBase.value)} · 表 \`${t}\``
+  patchAppendTo(cmpId, head + '\n' + stmts.join('\n') + (notes.length ? '\n-- 提示：' + notes.join('\n--       ') : ''))
+  toast(`已生成 ${stmts.length} 条索引/注释语句入「${libName(cmpId)}」待执行桶（可从 📋 补丁脚本 统一执行）`)
+}
+/** 表注释语句：目标 MySQL 用 ALTER TABLE ... COMMENT=，DM/神通用 COMMENT ON TABLE（各库原生写法，避免依赖转换）。 */
+function commentStmt(cmpId, t, text) {
+  return libTypeName(cmpId) === 'mysql'
+    ? 'ALTER TABLE `' + t + '` COMMENT=' + sqlStr(text) + ';'
+    : 'COMMENT ON TABLE `' + t + '` IS ' + sqlStr(text) + ';'
+}
 
 /* ---- 一键确认（同步动作 · 逐列确认总开关）----
  * 作用域 = 当前表 × 当前比对库；只影响有动作的行（add/drop/alt），pk 与 same 无动作不参与。
@@ -1093,6 +1213,41 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
                   <template v-else>
                     <DiffRow v-for="row in detailRows" :key="row.name" :row="row" :state="diffState"
                              @set-choice="onRowChoice" />
+                    <!-- 索引 / 表注释：列之外的 meta 差异（主键索引由列级 PK 表达，不在此列出；
+                         索引按「唯一性 + 列序列」签名比对，跨方言索引名不同也能对齐） -->
+                    <div class="meta-block">
+                      <div class="meta-head">
+                        <span class="meta-title">索引 / 表注释</span>
+                        <span class="meta-count">
+                          基准 {{ detailIndexView.baseCount }} 个 · 目标 {{ detailIndexView.cmpCount }} 个<template v-if="detailIndexView.same">（一致 {{ detailIndexView.same }}）</template>
+                        </span>
+                        <button type="button" class="btn small" :disabled="!detailMetaActionable"
+                                :title="detailMetaActionable ? '按基准库补齐目标库缺失的索引与表注释（目标多出的索引不删）' : '索引与表注释无需补项（目标缺整表时请用「生成建表脚本」一并还原）'"
+                                @click="genMetaPatch(diffCmp, diffTable)">⊕ 生成索引/注释补丁</button>
+                      </div>
+                      <div v-if="!detailIndexView.missing.length && !detailIndexView.extra.length && detailIndexView.comment.kind === 'same'"
+                           class="meta-empty">
+                        两侧索引一致{{ detailIndexView.baseCount ? '' : '（均无索引）' }} · 表注释一致
+                      </div>
+                      <template v-else>
+                        <div v-for="ix in detailIndexView.missing" :key="'m' + ix.name" class="meta-row">
+                          <span class="meta-tag tag-add">目标缺</span>
+                          <span class="meta-name">{{ ix.unique ? 'UNIQUE KEY' : 'KEY' }} {{ ix.name }}</span>
+                          <span class="meta-cols">({{ ix.cols }})</span>
+                        </div>
+                        <div v-for="ix in detailIndexView.extra" :key="'x' + ix.name" class="meta-row">
+                          <span class="meta-tag tag-extra">目标多</span>
+                          <span class="meta-name">{{ ix.unique ? 'UNIQUE KEY' : 'KEY' }} {{ ix.name }}</span>
+                          <span class="meta-cols">({{ ix.cols }})</span>
+                          <span class="meta-note">默认不删</span>
+                        </div>
+                        <div v-if="detailIndexView.comment.kind !== 'same'" class="meta-row">
+                          <span class="meta-tag tag-cmt">表注释</span>
+                          <span class="meta-name">基准「{{ detailIndexView.comment.base || '无' }}」 · 目标「{{ detailIndexView.comment.cmp || '无' }}」</span>
+                          <span class="meta-note">{{ detailIndexView.comment.txt }}</span>
+                        </div>
+                      </template>
+                    </div>
                   </template>
                 </div>
               </div>
@@ -1261,6 +1416,21 @@ export default { name: 'SchemaDiffDialog' }
 /* .diff-row / .diff-cell 等单行样式已迁入 DiffRow.vue（scoped 隔离） */
 .diff-actions-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; flex: 0 0 auto; }
 .diff-statline { font-size: 11.5px; color: var(--ink-500); }
+/* 索引 / 表注释区块（单表核对底部；浅色主题） */
+.meta-block { margin: 10px 12px 6px; border: 1px dashed var(--ink-100); border-radius: 10px; padding: 8px 10px 6px; background: var(--ink-50); }
+.meta-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.meta-title { font-size: 12px; font-weight: 800; color: var(--ink-700); }
+.meta-count { font-size: 11px; color: var(--ink-500); margin-right: auto; }
+.meta-empty { font-size: 11.5px; color: var(--ink-300); padding: 5px 0 2px; }
+.meta-row { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; padding: 4px 0; }
+.meta-row + .meta-row { border-top: 1px solid var(--ink-100); }
+.meta-tag { flex: 0 0 auto; font-size: 10px; font-weight: 800; border-radius: var(--r-pill); padding: 1px 7px; background: var(--ink-100); color: var(--ink-700); }
+.meta-tag.tag-add { background: #FDE7E7; color: #B23B3B; }
+.meta-tag.tag-extra { background: var(--ink-100); color: var(--ink-500); }
+.meta-tag.tag-cmt { background: #FDF3D7; color: #8A6210; }
+.meta-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-900); }
+.meta-cols { color: var(--ink-500); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.meta-note { margin-left: auto; font-size: 11px; color: var(--ink-300); }
 .missing-inline { color: #A84A3F; font-weight: 800; }
 .diff-actions-bar .btn.primary { margin-left: auto; }
 

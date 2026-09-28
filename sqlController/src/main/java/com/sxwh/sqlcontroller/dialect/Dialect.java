@@ -128,6 +128,33 @@ public interface Dialect {
     }
 
     /**
+     * 全库索引批量查询（字段对比快照用；参数：schema 名，不带表名条件）。
+     *
+     * <p>返回行需含：table_name、index_name、column_name、column_position，以及下列任一组合用于
+     * 判定唯一性/主键：{@code uniqueness}(UNIQUE/NONUNIQUE) 或 {@code non_unique}(0/1)，
+     * 可选 {@code constraint_type}(P/U) 与 {@code constraint_name}（唯一约束优先用约束名，如 DM 的 uk_xxx），
+     * 可选 {@code index_type}。服务端按表名+索引名分组、按 position 排序，一次查询拉全库。
+     * 返回 null 表示方言不支持（快照不含索引，前端不生成索引）。
+     */
+    default String schemaAllIndexesQuery() {
+        return "SELECT s.table_name, s.index_name, s.column_name, s.seq_in_index AS column_position, "
+                + "s.non_unique, s.index_type, "
+                + "CASE WHEN s.index_name = 'PRIMARY' THEN 'P' ELSE NULL END AS constraint_type, "
+                + "NULL AS constraint_name "
+                + "FROM information_schema.statistics s WHERE s.table_schema = ? "
+                + "ORDER BY s.table_name, s.index_name, s.seq_in_index";
+    }
+
+    /**
+     * 全库表注释批量查询（字段对比快照用；参数：schema 名）。
+     * 返回行需含 table_name 与 comments（或 table_comment）；null=不做表注释探测。
+     */
+    default String schemaAllTableCommentsQuery() {
+        return "SELECT table_name, table_comment AS comments FROM information_schema.tables "
+                + "WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name";
+    }
+
+    /**
      * MySQL {@code ALTER TABLE ... MODIFY COLUMN} 改写为本方言的「改列」语句集合（完整 ALTER 语句，可多条）。
      *
      * @param table  已加引号的表名

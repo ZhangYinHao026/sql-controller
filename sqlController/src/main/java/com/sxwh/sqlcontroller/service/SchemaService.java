@@ -5,6 +5,7 @@ import com.sxwh.sqlcontroller.dialect.Dialect;
 import com.sxwh.sqlcontroller.dialect.DialectRegistry;
 import com.sxwh.sqlcontroller.model.ColumnInfo;
 import com.sxwh.sqlcontroller.model.DatabaseConnection;
+import com.sxwh.sqlcontroller.model.IndexInfo;
 import com.sxwh.sqlcontroller.model.SchemaResponse;
 import com.sxwh.sqlcontroller.model.SchemaSnapshot;
 import com.sxwh.sqlcontroller.model.TableInfo;
@@ -21,6 +22,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -225,6 +227,8 @@ public class SchemaService {
         String pkSql = mysql ? null : dialect.schemaPkColumnsQuery();
         String commentSql = mysql ? null : dialect.schemaColumnCommentQuery();
         Map<String, Map<String, Boolean>> identityByTable = loadIdentityByTable(conn, dialect, schema, mysql);
+        Map<String, List<IndexInfo>> indexByTable = loadIndexesByTable(conn, dialect, schema);
+        Map<String, String> tableCommentByTable = loadTableComments(conn, dialect, schema);
         List<TableInfo> out = new ArrayList<>(tableNames.size());
         for (String tableName : tableNames) {
             if (isSystemTable(tableName)) {
@@ -259,6 +263,7 @@ public class SchemaService {
                     }
                 }
                 if (!info.getColumns().isEmpty()) {
+                    enrichTableMeta(info, indexByTable, tableCommentByTable);
                     out.add(info);
                 }
             } catch (Exception e) {
@@ -316,6 +321,8 @@ public class SchemaService {
         Map<String, Map<String, Boolean>> pkByTable = null;
         Map<String, Map<String, Boolean>> identityByTable = loadIdentityByTable(conn, dialect, schema, mysql);
         Map<String, Map<String, String>> commentByTable = null;
+        Map<String, List<IndexInfo>> indexByTable = loadIndexesByTable(conn, dialect, schema);
+        Map<String, String> tableCommentByTable = loadTableComments(conn, dialect, schema);
         boolean enrichWarned = false;
         if (!mysql) {
             String pkSql = dialect.schemaAllPkColumnsQuery();
@@ -360,6 +367,7 @@ public class SchemaService {
                         info.getColumns().add(col);
                     }
                 }
+                enrichTableMeta(info, indexByTable, tableCommentByTable);
                 byName.put(tableName, info);
             } catch (Exception e) {
                 log.warn("[SchemaService] 表 {} 结构快照失败: {}", tableName, e.getMessage());
@@ -379,6 +387,8 @@ public class SchemaService {
         String pkSql = mysql ? null : dialect.schemaPkColumnsQuery();
         String commentSql = mysql ? null : dialect.schemaColumnCommentQuery();
         Map<String, Map<String, Boolean>> identityByTable = loadIdentityByTable(conn, dialect, schema, mysql);
+        Map<String, List<IndexInfo>> indexByTable = loadIndexesByTable(conn, dialect, schema);
+        Map<String, String> tableCommentByTable = loadTableComments(conn, dialect, schema);
         boolean enrichWarned = false;
         int truncated = 0;
 
@@ -424,6 +434,7 @@ public class SchemaService {
                         info.getColumns().add(col);
                     }
                 }
+                enrichTableMeta(info, indexByTable, tableCommentByTable);
                 byName.put(tableName, info);
             } catch (Exception e) {
                 log.warn("[SchemaService] 表 {} 结构快照失败: {}", tableName, e.getMessage());
@@ -559,7 +570,7 @@ public class SchemaService {
 
     /** 执行结果 rows（过滤非 Map 行），保持行序。 */
     @SuppressWarnings("unchecked")
-    private List<Map<?, ?>> rowMaps(Map<String, Object> result) {
+    private static List<Map<?, ?>> rowMaps(Map<String, Object> result) {
         List<Map<?, ?>> out = new ArrayList<>();
         Object rowsObj = result.get("rows");
         if (rowsObj instanceof List<?>) {
@@ -639,8 +650,154 @@ public class SchemaService {
         return map;
     }
 
-    /** 执行结果 rows 里取 key 列 → value 列的小写规范化映射（用于注释探测）。 */
-    @SuppressWarnings("unchecked")
+    /* ==================== 索引 / 表注释增强（字段对比快照用） ==================== */
+
+    /**
+     * 索引行 → 表名分组（保行序：表序=字典排序，索引内列按 position 升序）。
+     *
+     * <p>唯一性/主键判定跨方言兼容：{@code constraint_type}（DM/神通 P=主键 U=唯一）优先，
+     * 其次 {@code uniqueness}(UNIQUE/NONUNIQUE)，再次 {@code non_unique}(0/1)，
+     * 最后索引名 PRIMARY（MySQL 主键索引名）。命名优先取约束名——达梦唯一约束的
+     * 索引名是系统生成的 INDEX33611650，约束名才是人写的 {@code uk_sys_upload_file_name}，
+     * 生成的建表/补丁按约束名重建更可读。
+     *
+     * <p>列用 TreeMap 按 position 落位：既纠正字典未按序返回的情况，也天然丢弃 LEFT JOIN
+     * 多约束产生的重复行；position 缺失时按出现顺序排在最后。
+     */
+    static Map<String, List<IndexInfo>> groupIndexesByTable(Map<String, Object> result) {
+        Map<String, Map<String, IndexInfo>> meta = new LinkedHashMap<>();
+        Map<String, Map<String, TreeMap<Integer, String>>> colsOf = new LinkedHashMap<>();
+        int missingPos = 0;
+        for (Map<?, ?> row : rowMaps(result)) {
+            String table = str(row, "table_name");
+            String index = str(row, "index_name");
+            String column = str(row, "column_name");
+            if (table == null || index == null || column == null || column.trim().isEmpty()) {
+                continue;
+            }
+            String ctype = str(row, "constraint_type");
+            String cname = str(row, "constraint_name");
+            String key = norm(index);
+            Map<String, IndexInfo> perTable = meta.computeIfAbsent(table, k -> new LinkedHashMap<>());
+            if (!perTable.containsKey(key)) {
+                boolean constrained = "U".equalsIgnoreCase(ctype) || "P".equalsIgnoreCase(ctype);
+                IndexInfo ix = new IndexInfo();
+                ix.setName(constrained && cname != null && !cname.trim().isEmpty() ? cname : index);
+                boolean primary = "P".equalsIgnoreCase(ctype) || "PRIMARY".equalsIgnoreCase(index.trim());
+                ix.setPrimary(primary);
+                ix.setUnique(!primary && isUniqueIndexRow(row, ctype));
+                ix.setType(str(row, "index_type"));
+                perTable.put(key, ix);
+            }
+            Long pos = asLong(str(row, "column_position"));
+            int p = pos == null ? Integer.MIN_VALUE + (++missingPos) : pos.intValue();
+            colsOf.computeIfAbsent(table, k -> new LinkedHashMap<>())
+                    .computeIfAbsent(key, k -> new TreeMap<>())
+                    .putIfAbsent(p, column);
+        }
+        Map<String, List<IndexInfo>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Map<String, IndexInfo>> e : meta.entrySet()) {
+            Map<String, TreeMap<Integer, String>> perTableCols = colsOf.get(e.getKey());
+            List<IndexInfo> list = new ArrayList<>();
+            for (Map.Entry<String, IndexInfo> ie : e.getValue().entrySet()) {
+                IndexInfo ix = ie.getValue();
+                TreeMap<Integer, String> c = perTableCols == null ? null : perTableCols.get(ie.getKey());
+                if (c != null) {
+                    ix.getColumns().addAll(c.values());
+                }
+                if (!ix.getColumns().isEmpty()) {
+                    list.add(ix);   // 无列可取的索引（特殊/内部索引）不进快照
+                }
+            }
+            out.put(e.getKey(), list);
+        }
+        return out;
+    }
+
+    /** 该索引行是否唯一（已排除主键；uniqueness 优先，退化到 non_unique）。 */
+    private static boolean isUniqueIndexRow(Map<?, ?> row, String constraintType) {
+        if ("U".equalsIgnoreCase(constraintType)) {
+            return true;
+        }
+        String uniq = str(row, "uniqueness");
+        if (uniq != null && !uniq.trim().isEmpty()) {
+            return "UNIQUE".equalsIgnoreCase(uniq.trim());
+        }
+        String nonUnique = str(row, "non_unique");
+        if (nonUnique != null && !nonUnique.trim().isEmpty()) {
+            String v = nonUnique.trim();
+            return "0".equals(v) || "false".equalsIgnoreCase(v);
+        }
+        return false;
+    }
+
+    /** 表注释行 → 表名映射（comments 或 table_comment 列皆可；空注释视为无）。 */
+    static Map<String, String> groupTableComments(Map<String, Object> result) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map<?, ?> row : rowMaps(result)) {
+            String table = str(row, "table_name");
+            if (table == null) {
+                continue;
+            }
+            String comment = str(row, "comments");
+            if (comment == null) {
+                comment = str(row, "table_comment");
+            }
+            if (comment != null && !comment.trim().isEmpty()) {
+                out.put(table, comment);
+            }
+        }
+        return out;
+    }
+
+    /** 全库索引映射（表名 → 索引清单）；方言不支持或查询失败返回 null（快照不含索引，前端不生成）。 */
+    private Map<String, List<IndexInfo>> loadIndexesByTable(DatabaseConnection conn, Dialect dialect, String schema) {
+        String sql = dialect.schemaAllIndexesQuery();
+        if (sql == null) {
+            return null;
+        }
+        try {
+            return groupIndexesByTable(executor.executeRaw(conn, sql, Collections.singletonList(schema)));
+        } catch (Exception e) {
+            log.warn("[SchemaService] 索引增强查询失败将降级 dbType={}: {}", conn.getDbType(), e.getMessage());
+            return null;
+        }
+    }
+
+    /** 全库表注释映射（表名 → 注释）；方言不支持或查询失败返回 null。 */
+    private Map<String, String> loadTableComments(DatabaseConnection conn, Dialect dialect, String schema) {
+        String sql = dialect.schemaAllTableCommentsQuery();
+        if (sql == null) {
+            return null;
+        }
+        try {
+            return groupTableComments(executor.executeRaw(conn, sql, Collections.singletonList(schema)));
+        } catch (Exception e) {
+            log.warn("[SchemaService] 表注释增强查询失败将降级 dbType={}: {}", conn.getDbType(), e.getMessage());
+            return null;
+        }
+    }
+
+    /** 把索引/表注释挂到表上（缺失即保持空，不影响列主流程）。 */
+    private void enrichTableMeta(TableInfo info, Map<String, List<IndexInfo>> ixByTable, Map<String, String> cmtByTable) {
+        if (info == null) {
+            return;
+        }
+        if (ixByTable != null) {
+            List<IndexInfo> ix = ixByTable.get(info.getName());
+            if (ix != null) {
+                info.setIndexes(ix);
+            }
+        }
+        if (cmtByTable != null) {
+            String comment = cmtByTable.get(info.getName());
+            if (comment != null) {
+                info.setComment(comment);
+            }
+        }
+    }
+
+    /** 执行结果 rows 里取 key 列 → value 列的小写规范化映射（用于注释探测）。 */    @SuppressWarnings("unchecked")
     private Map<String, String> queryStringMap(Map<String, Object> result, String keyCol, String[] valueCols) {
         Map<String, String> map = new LinkedHashMap<>();
         Object rowsObj = result.get("rows");
@@ -783,7 +940,7 @@ public class SchemaService {
     }
 
     /** 大小写不敏感取值（MySQL 小写列名 / 达梦可能大写列名）。 */
-    private String str(Map<?, ?> row, String key) {
+    private static String str(Map<?, ?> row, String key) {
         if (row == null) return null;
         for (Map.Entry<?, ?> e : row.entrySet()) {
             if (e.getKey() != null && key.equalsIgnoreCase(e.getKey().toString())) {

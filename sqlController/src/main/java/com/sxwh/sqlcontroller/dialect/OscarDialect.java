@@ -127,6 +127,31 @@ public class OscarDialect extends AbstractDialect {
     }
 
     /**
+     * 全库索引批量探测（参数：schema 名 = 用户名）。
+     *
+     * <p>神通提供 Oracle 兼容视图：all_indexes（唯一性/类型）+ all_ind_columns（索引列与列序）
+     * + all_constraints（约束名，U=唯一；神通主键约束索引同样汇总在此）。
+     * 语义与达梦实现一致（见 {@link DmDialect#schemaAllIndexesQuery()}）。
+     */
+    @Override
+    public String schemaAllIndexesQuery() {
+        return "SELECT i.table_name, i.index_name, i.uniqueness, i.index_type, "
+                + "c.constraint_name, c.constraint_type, ic.column_name, ic.column_position "
+                + "FROM all_indexes i "
+                + "JOIN all_ind_columns ic ON ic.index_owner = i.owner AND ic.index_name = i.index_name "
+                + "AND ic.table_name = i.table_name "
+                + "LEFT JOIN all_constraints c ON c.owner = i.owner AND c.table_name = i.table_name "
+                + "AND c.index_name = i.index_name "
+                + "WHERE i.owner = ? ORDER BY i.table_name, i.index_name, ic.column_position";
+    }
+
+    @Override
+    public String schemaAllTableCommentsQuery() {
+        return "SELECT table_name, comments FROM all_tab_comments WHERE owner = ? AND table_name IS NOT NULL "
+                + "ORDER BY table_name";
+    }
+
+    /**
      * 神通（PG 内核）不支持 MySQL 融合式 {@code MODIFY COLUMN ...}，改列需按语义拆分独立语句：
      * TYPE 变类型；SET/DROP NOT NULL 变可空；SET DEFAULT 变默认值。注释由调用方在全部 ALTER 后追加 COMMENT ON。
      */

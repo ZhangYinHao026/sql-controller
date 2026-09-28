@@ -3,6 +3,7 @@ package com.sxwh.sqlcontroller.service;
 import com.alibaba.druid.DbType;
 import com.alibaba.druid.sql.SQLUtils;
 import com.alibaba.druid.sql.ast.SQLExpr;
+import com.alibaba.druid.sql.ast.expr.SQLCharExpr;
 import com.alibaba.druid.sql.ast.SQLName;
 import com.alibaba.druid.sql.ast.SQLStatement;
 import com.alibaba.druid.sql.ast.statement.SQLAlterTableAddColumn;
@@ -160,16 +161,25 @@ public class SqlConvertService {
                     // 表级主键约束必须带括号：PRIMARY KEY (id)。colList 只返回列名清单，括号在此补齐。
                     parts.add("PRIMARY KEY (" + colList(((SQLPrimaryKey) el).getColumns(), dialect) + ")");
                 } else if (el instanceof SQLUniqueConstraint) {
-                    // Druid MySQL 方言下：KEY idx (col) 和 UNIQUE KEY uk (col) 都被解析为 SQLUniqueConstraint。
-                    // 按 toString() 是否含 UNIQUE 关键字区分：含→CONSTRAINT UNIQUE；不含→普通索引 CREATE INDEX
+                    // Druid MySQL 方言下：UNIQUE KEY uk (col) → MySqlUnique，KEY idx (col) → MySqlKey，
+                    // 两者都是 SQLUniqueConstraint，按 toString() 是否含 UNIQUE 关键字区分：
+                    // 含 → 保留为表级 CONSTRAINT ... UNIQUE；不含 → 达梦/神通不支持表内联索引，
+                    // 改写为独立 CREATE INDEX。
+                    //
+                    // 注意：Druid 的 SQLName 保留了原始反引号（MySqlKey.getName().getSimpleName()
+                    // 返回 "`idx_suf_biz`"），必须 unquote 后再 dialect.quote，否则会生成
+                    // 「CONSTRAINT `UK_X`」/「CREATE INDEX `idx_x`」这类目标库非法语法；
+                    // 索引名与列也一律取 AST（早期版本按 toString 正则取名字，会把关键字 KEY 当索引名）。
                     SQLUniqueConstraint uk = (SQLUniqueConstraint) el;
                     String text = el.toString().toUpperCase();
                     if (text.contains("UNIQUE")) {
-                        String nm = uk.getName() == null ? "" : dialect.quote(uk.getName().getSimpleName()) + " ";
+                        String nm = uk.getName() == null ? ""
+                                : dialect.quote(AbstractDialect.unquote(AbstractDialect.simpleName(uk.getName()))) + " ";
                         parts.add("CONSTRAINT " + nm + "UNIQUE (" + colList(uk.getColumns(), dialect) + ")");
+                    } else if (uk.getName() != null && uk.getColumns() != null && !uk.getColumns().isEmpty()) {
+                        indexes.add(createIndexStatement(false, uk.getName(), table, uk.getColumns(), dialect));
                     } else {
-                        indexes.add("CREATE INDEX " + dialect.quote(extractIndexName(el.toString()))
-                                + " ON " + table + " (" + extractColumns(el.toString()) + ")");
+                        warn(out, "表内索引缺少名称或列，已跳过：" + el);
                     }
                 } else if (el instanceof SQLForeignKeyConstraint) {
                     // 外键语法各库差异小，按原样保留 + 提示核对
@@ -180,8 +190,18 @@ public class SqlConvertService {
                     String text = el.toString();
                     Matcher m = INDEX_DEF.matcher(text);
                     if (m.find()) {
-                        indexes.add("CREATE INDEX " + dialect.quote(extractIndexName(m.group(3)))
-                                + " ON " + table + " (" + extractColumns(m.group(3)) + ")");
+                        String idxName = AbstractDialect.unquote(extractIndexName(m.group(3)));
+                        String colText = extractColumns(m.group(3));
+                        if (!idxName.isEmpty() && !colText.isEmpty()) {
+                            List<String> qCols = new ArrayList<>();
+                            for (String c : colText.split(",")) {
+                                qCols.add(dialect.quote(AbstractDialect.unquote(c)));
+                            }
+                            indexes.add("CREATE INDEX " + dialect.quote(idxName) + " ON " + table
+                                    + " (" + String.join(", ", qCols) + ")");
+                        } else {
+                            warn(out, "表内索引未识别，已跳过：" + text);
+                        }
                     } else {
                         parts.add(text);
                         warn(out, "表级元素未识别已按原样保留：" + text);
@@ -194,10 +214,32 @@ public class SqlConvertService {
         // 4) 索引、列注释、表注释依次跟在建表语句之后（COMMENT ON 必须等表已存在）
         out.getStatements().addAll(indexes);
         out.getStatements().addAll(comments);
-        Matcher cm = TABLE_COMMENT.matcher(ct.toString());
-        if (cm.find()) {
-            out.getStatements().add(dialect.commentOnTable(table, cm.group(1)));
+        // 表注释优先取 AST 字段：Druid 会把 MySQL 的 COMMENT='x' 规整成 COMMENT 'x' 存进 comment
+        // （toString 里不再有等号，旧正则匹配不到 → 表注释被整条丢掉）；正则兜底兼容未归一形态。
+        String tableComment = literalText(ct.getComment());
+        if (tableComment == null || tableComment.trim().isEmpty()) {
+            Matcher cm = TABLE_COMMENT.matcher(ct.toString());
+            tableComment = cm.find() ? cm.group(1) : null;
         }
+        if (tableComment != null && !tableComment.trim().isEmpty()) {
+            out.getStatements().add(dialect.commentOnTable(table, tableComment));
+        }
+    }
+
+    /** SQLExpr 字面量文本：字符字面量取裸文本（不含引号），其它按 toString；null 原样返回。 */
+    private static String literalText(SQLExpr expr) {
+        if (expr == null) {
+            return null;
+        }
+        if (expr instanceof SQLCharExpr) {
+            String text = ((SQLCharExpr) expr).getText();
+            return text == null ? "" : text;
+        }
+        String s = expr.toString().trim();
+        if (s.length() >= 2 && s.startsWith("'") && s.endsWith("'")) {
+            return s.substring(1, s.length() - 1).replace("''", "'");
+        }
+        return s;
     }
 
     /** 生成单个列定义；列注释拆成独立 COMMENT ON COLUMN 语句，先收集到 pendingComments 由调用方在建表/ALTER 之后输出。

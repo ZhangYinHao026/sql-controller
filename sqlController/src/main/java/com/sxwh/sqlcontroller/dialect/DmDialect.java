@@ -127,4 +127,31 @@ public class DmDialect extends AbstractDialect {
                 + "WHERE s.name = ? AND s.pid = u.id AND u.subtype$ = 'USER')";
     }
 
+    /**
+     * 全库索引批量探测（参数：schema 名）。
+     *
+     * <p>三表联查：all_indexes 给唯一性/类型，all_ind_columns 给索引列与列序，
+     * all_constraints 给约束名与约束类型（P=主键、U=唯一）——达梦的唯一约束索引用的是系统生成名
+     * （INDEX33611650），约束名才是人写的 uk_sys_upload_file_name，下游按约束名重建更可读。
+     * 纯索引（无约束）约束名为 null，退回索引名。INNER JOIN all_ind_columns 会自然滤掉
+     * 无列信息的特殊索引（如达梦 CLUSTER 类型内部索引），避免生成无列索引。
+     */
+    @Override
+    public String schemaAllIndexesQuery() {
+        return "SELECT i.table_name, i.index_name, i.uniqueness, i.index_type, "
+                + "c.constraint_name, c.constraint_type, ic.column_name, ic.column_position "
+                + "FROM all_indexes i "
+                + "JOIN all_ind_columns ic ON ic.index_owner = i.owner AND ic.index_name = i.index_name "
+                + "AND ic.table_name = i.table_name "
+                + "LEFT JOIN all_constraints c ON c.owner = i.owner AND c.table_name = i.table_name "
+                + "AND c.index_name = i.index_name "
+                + "WHERE i.owner = ? ORDER BY i.table_name, i.index_name, ic.column_position";
+    }
+
+    @Override
+    public String schemaAllTableCommentsQuery() {
+        return "SELECT table_name, comments FROM all_tab_comments WHERE owner = ? AND table_name IS NOT NULL "
+                + "ORDER BY table_name";
+    }
+
 }
