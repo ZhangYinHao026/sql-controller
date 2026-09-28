@@ -34,7 +34,39 @@ export function lit(v) {
   if (typeof v === 'number') return String(v)
   const s = String(v)
   if (/^CURRENT_TIMESTAMP(\(\d+\))?$|^NOW\(\)$/i.test(s)) return s
+  // 字典取回的默认值多为字符串（DM/神通 data_default、MySQL column_default），数字形态按数字输出，
+  // 避免整型列生成 DEFAULT '0'（虽合法但不符预期、且与基准库写法不一致）。
+  if (/^[+-]?\d+(\.\d+)?$/.test(s.trim())) return s.trim()
   return sqlStr(s)
+}
+
+/**
+ * 默认值归一（跨方言比较/生成前统一形态）。
+ *
+ * <p>字典原文差异很大：DM/神通 data_default 会带外层括号与单引号（`'abc'`、`(0)`），
+ * MySQL column_default 不带引号且用 `NULL` 表示无默认值。统一为「裸值」：
+ * 去空白 → 剥成对圆括号 → 剥成对单引号（转义还原）→ 时间函数关键词大写。
+ *
+ * @returns 归一后的值；null/空/NULL 字面量 → undefined（表示无默认值）
+ */
+export function normDefault(v) {
+  if (v === undefined || v === null) return undefined
+  let s = String(v).trim()
+  if (!s || /^null$/i.test(s)) return undefined
+  for (let i = 0; i < 3; i++) {
+    if (s.length > 1 && s.startsWith('(') && s.endsWith(')')) s = s.slice(1, -1).trim()
+    else break
+  }
+  let quoted = false
+  for (let i = 0; i < 2; i++) {
+    if (s.length > 1 && s.startsWith("'") && s.endsWith("'")) { s = s.slice(1, -1).replace(/''/g, "'").trim(); quoted = true }
+    else break
+  }
+  if (!s) return quoted ? '' : undefined
+  if (/^(current_timestamp|current_date|current_time|now|sysdate|localtime|localtimestamp)(\(\d*\))?$/i.test(s)) {
+    return s.toUpperCase()
+  }
+  return s
 }
 
 /** 两库列名并集（保序：先基准后比对新增；按标识符忽略大小写去重，保留先出现的原始写法）。 */
@@ -113,7 +145,7 @@ export function colStatus(l, r) {
   const rs = []
   if (normType(l.type) !== normType(r.type)) rs.push('类型 ' + r.type + ' → ' + l.type)
   if (!!l.notNull !== !!r.notNull) rs.push(l.notNull ? '改为 NOT NULL' : '改为可空 NULL')
-  const ld = l.default, rd = r.default
+  const ld = normDefault(l.default), rd = normDefault(r.default)
   if ((ld !== undefined || rd !== undefined) && (ld ?? null) !== (rd ?? null))
     rs.push('默认值 ' + (rd === undefined ? '(无)' : rd) + ' → ' + (ld === undefined ? '(无)' : ld))
   if ((l.comment !== undefined || r.comment !== undefined) && String(l.comment || '') !== String(r.comment || ''))
@@ -155,19 +187,60 @@ export function genMod(l, r) {
 }
 
 /**
+ * 生成 MySQL 风格 CREATE TABLE 前的类型整备。
+ *
+ * <p>两件事：①**类型名等价转写**——基准库可能是 DM/神通，字典给出的 VARCHAR2/NUMBER/CLOB
+ * 等名字在 MySQL 下非法或语义不符，转成等价 MySQL 名；②**长度/精度兜底**——
+ * 若拿到的类型缺参数（旧快照、方言未给长度），补编译期合法的最小值并给出提示，
+ * 避免生成 `VARCHAR` 这类 MySQL 语法错误（Error 1064）。
+ *
+ * @returns {{type:string, hints:string[]}}
+ */
+export function toMysqlType(f, table) {
+  const raw = String(f.type || '').trim() || 'VARCHAR(255)'
+  const hints = []
+  let t = raw
+  // ① 类型名转写（DM/神通 → MySQL 等价名）
+  const renamed = t.replace(/\bVARCHAR2\b/gi, 'VARCHAR')
+    .replace(/\bNVARCHAR2\b/gi, 'VARCHAR')
+    .replace(/\bNUMBER\b/gi, 'DECIMAL')
+    .replace(/\bNCLOB\b/gi, 'LONGTEXT')
+    .replace(/\bCLOB\b/gi, 'LONGTEXT')
+    .replace(/\bRAW\b/gi, 'VARBINARY')
+    .replace(/\bBINARY_DOUBLE\b/gi, 'DOUBLE')
+    .replace(/\bBINARY_FLOAT\b/gi, 'FLOAT')
+  if (renamed !== t) { hints.push('列 ' + f.name + '：类型 ' + t + ' → ' + renamed + '（MySQL 等价名）'); t = renamed }
+  // ② 长度/精度兜底
+  if (t.indexOf('(') < 0) {
+    const u = t.toUpperCase().replace(/\s+/g, ' ').trim()
+    if (/^(VARCHAR|CHAR|NVARCHAR|NCHAR|CHARACTER|CHARACTER VARYING|NCHAR VARYING|BINARY|VARBINARY)$/.test(u)) {
+      t += '(255)'
+      hints.push('列 ' + f.name + '：类型缺长度，已按 ' + t + ' 兜底（请核对实际长度）')
+    } else if (/^(DECIMAL|NUMERIC|DEC)$/.test(u)) {
+      t += '(38,0)'
+      hints.push('列 ' + f.name + '：类型缺精度，已按 ' + t + ' 兜底（请核对精度/标度）')
+    }
+  }
+  return { type: t, hints }
+}
+
+/**
  * 缺整表直接补：按基准库列快照生成 MySQL 风格 CREATE TABLE（执行时跨方言由后端转换器翻译）。
  * 与 genAdd 语义不同点：CREATE 的表无数据行，NOT NULL 无默认值合法，无需兜底 DEFAULT。
  * @param table 表名
  * @param cols 基准库列（引擎列：{name,type,pk,notNull,comment,autoIncrement,default?}）
- * @param notes 可选，收集生成提示（目前无；保留签名便于未来扩展）
+ * @param notes 可选，收集生成提示（类型转写/长度兜底等）；未传时提示以 SQL 注释形式置于语句前
  * @returns CREATE TABLE 完整语句（列清单多行缩进；主键收集为表级 PRIMARY KEY）
  */
 export function genCreateTable(table, cols, notes) {
   const defs = []
   const pks = []
+  const hints = []
   ;(cols || []).forEach(f => {
     if (!f || !f.name) return
-    let s = '  `' + f.name + '` ' + (f.type || 'VARCHAR(255)')
+    const tt = toMysqlType(f, table)
+    tt.hints.forEach(h => hints.push(h))
+    let s = '  `' + f.name + '` ' + tt.type
     if (f.pk || f.autoIncrement) s += ' NOT NULL'           // 主键/自增列必须非空
     else if (f.notNull) s += ' NOT NULL'
     else s += ' NULL'
@@ -181,7 +254,10 @@ export function genCreateTable(table, cols, notes) {
   const head = 'CREATE TABLE `' + table + '` (\n'
   const body = defs.join(',\n')
   const tail = '\n);'
-  return head + body + tail
+  const sql = head + body + tail
+  if (notes) hints.forEach(h => notes.push(h))
+  else if (hints.length) return hints.map(h => '-- ' + h).join('\n') + '\n' + sql
+  return sql
 }
 
 /** 列的展示元信息（Vue 模板用）：[{k:'type'|'pk'|'null'|'default'|'cmt', v:文本}]。 */
@@ -195,7 +271,7 @@ export function metaParts(f) {
   return p
 }
 
-/** 后端快照列(ColumnInfo) → 引擎列。default 后端未抓取 → undefined（colStatus 默认值比较优雅降级）。 */
+/** 后端快照列(ColumnInfo) → 引擎列。default 取 defaultValue 并归一（后端未抓取 → undefined，colStatus 优雅降级）。 */
 export function toEngineCol(c) {
   if (!c) return null
   return {
@@ -204,7 +280,8 @@ export function toEngineCol(c) {
     pk: !!c.primaryKey,
     notNull: c.nullable === false,
     autoIncrement: !!c.autoIncrement,
-    comment: c.comment || undefined
+    comment: c.comment || undefined,
+    default: normDefault(c.defaultValue)
   }
 }
 

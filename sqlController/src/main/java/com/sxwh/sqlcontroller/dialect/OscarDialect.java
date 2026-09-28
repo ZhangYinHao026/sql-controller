@@ -85,7 +85,7 @@ public class OscarDialect extends AbstractDialect {
     // 字段对比快照：详情/主键/注释分走三个字典查询；主键与注释查询若库不支持会抛错，服务侧捕获后降级跳过
     @Override
     public String schemaColumnDetailQuery() {
-        return "SELECT column_name, data_type, nullable, char_length, data_precision, data_scale "
+        return "SELECT column_name, data_type, nullable, char_length, data_length, data_precision, data_scale, data_default "
                 + "FROM all_tab_columns WHERE owner = ? AND table_name = ? ORDER BY column_id";
     }
 
@@ -104,7 +104,7 @@ public class OscarDialect extends AbstractDialect {
     // 批量版（字段对比快照根治 N+1）：固定 3 条拉全库列/主键/注释，服务端按 table_name 分组
     @Override
     public String schemaAllColumnsQuery() {
-        return "SELECT table_name, column_name, data_type, nullable, char_length, data_precision, data_scale "
+        return "SELECT table_name, column_name, data_type, nullable, char_length, data_length, data_precision, data_scale, data_default "
                 + "FROM all_tab_columns WHERE owner = ? ORDER BY table_name, column_id";
     }
 

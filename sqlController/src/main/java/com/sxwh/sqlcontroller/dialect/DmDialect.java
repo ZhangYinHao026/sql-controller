@@ -75,7 +75,7 @@ public class DmDialect extends AbstractDialect {
 
     @Override
     public String schemaColumnDetailQuery() {
-        return "SELECT column_name, data_type, nullable, char_length, data_precision, data_scale "
+        return "SELECT column_name, data_type, nullable, char_length, data_length, data_precision, data_scale, data_default "
                 + "FROM all_tab_columns WHERE owner = ? AND table_name = ? ORDER BY column_id";
     }
 
@@ -94,7 +94,7 @@ public class DmDialect extends AbstractDialect {
     // 批量版（字段对比快照根治 N+1）：固定 3 条拉全库列/主键/注释，服务端按 table_name 分组
     @Override
     public String schemaAllColumnsQuery() {
-        return "SELECT table_name, column_name, data_type, nullable, char_length, data_precision, data_scale "
+        return "SELECT table_name, column_name, data_type, nullable, char_length, data_length, data_precision, data_scale, data_default "
                 + "FROM all_tab_columns WHERE owner = ? ORDER BY table_name, column_id";
     }
 
@@ -109,6 +109,22 @@ public class DmDialect extends AbstractDialect {
     public String schemaAllColumnCommentsQuery() {
         return "SELECT table_name, column_name, comments FROM all_col_comments WHERE owner = ? "
                 + "ORDER BY table_name, column_name";
+    }
+
+    /**
+     * 全库自增列批量探测（参数：schema 名）。
+     *
+     * <p>达梦的 all_tab_columns 不暴露自增标识，自增信息在系统表 syscolumns.info2 的最低位
+     * （实测 {id} IDENTITY(1,1) → info2=1，普通列=0）。syscolumns 无 owner 列，需经 sysobjects
+     * 关联到当前模式：模式对象是一条 name=模式名、pid 指向该 USER 对象的记录
+     * （USER 对象 subtype$='USER'），其 id 即表的 schid。
+     */
+    @Override
+    public String schemaAllIdentityColumnsQuery() {
+        return "SELECT o.name AS table_name, c.name AS column_name FROM syscolumns c, sysobjects o "
+                + "WHERE c.id = o.id AND bitand(c.info2, 1) = 1 "
+                + "AND o.schid IN (SELECT s.id FROM sysobjects s, sysobjects u "
+                + "WHERE s.name = ? AND s.pid = u.id AND u.subtype$ = 'USER')";
     }
 
 }

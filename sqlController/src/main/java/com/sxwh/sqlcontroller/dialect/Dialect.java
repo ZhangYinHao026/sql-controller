@@ -67,10 +67,10 @@ public interface Dialect {
      * <p>MySQL 默认走 information_schema.columns 一行带全量语义字段；非 MySQL 方言应覆盖为
      * 各自数据字典写法（如 all_tab_columns）。返回行中可识别的列（大小写不敏感）：
      * column_name / column_type 或 data_type / is_nullable 或 nullable / column_key(PRI) /
-     * extra(含 auto_increment) / column_comment。
+     * extra(含 auto_increment) / column_comment / column_default 或 data_default。
      */
     default String schemaColumnDetailQuery() {
-        return "SELECT column_name, column_type AS data_type, is_nullable, column_key, extra, column_comment "
+        return "SELECT column_name, column_type AS data_type, is_nullable, column_key, extra, column_comment, column_default "
                 + "FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position";
     }
 
@@ -114,6 +114,16 @@ public interface Dialect {
      * 返回行需含 table_name、column_name、comments（或 comment）；null=不做批量注释探测（回退逐表或降级跳过）。
      */
     default String schemaAllColumnCommentsQuery() {
+        return null;
+    }
+
+    /**
+     * 全库自增列批量探测（字段对比快照用；参数：schema 名，不带表名条件）。
+     * 返回行需含 table_name 与 column_name；null=不做自增探测（autoIncrement 保持未探测=null，前端不生成 AUTO_INCREMENT）。
+     *
+     * <p>MySQL 走 information_schema 的 extra 列即可，无需本条；DM/神通等字典不暴露自增标识时才需要。
+     */
+    default String schemaAllIdentityColumnsQuery() {
         return null;
     }
 

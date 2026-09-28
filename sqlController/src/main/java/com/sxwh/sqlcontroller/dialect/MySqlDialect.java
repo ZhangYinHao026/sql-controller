@@ -35,10 +35,10 @@ public class MySqlDialect extends AbstractDialect {
         return Collections.emptyList();
     }
 
-    /** 字段对比快照批量列查询：一条拉全库列（含主键/自增/注释/可空），服务端按 table_name 分组。 */
+    /** 字段对比快照批量列查询：一条拉全库列（含主键/自增/注释/可空/默认值），服务端按 table_name 分组。 */
     @Override
     public String schemaAllColumnsQuery() {
-        return "SELECT table_name, column_name, column_type AS data_type, is_nullable, column_key, extra, column_comment "
+        return "SELECT table_name, column_name, column_type AS data_type, is_nullable, column_key, extra, column_comment, column_default "
                 + "FROM information_schema.columns WHERE table_schema = ? ORDER BY table_name, ordinal_position";
     }
 

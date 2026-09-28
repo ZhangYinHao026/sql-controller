@@ -15,10 +15,12 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -222,6 +224,7 @@ public class SchemaService {
         String detailSql = dialect.schemaColumnDetailQuery();
         String pkSql = mysql ? null : dialect.schemaPkColumnsQuery();
         String commentSql = mysql ? null : dialect.schemaColumnCommentQuery();
+        Map<String, Map<String, Boolean>> identityByTable = loadIdentityByTable(conn, dialect, schema, mysql);
         List<TableInfo> out = new ArrayList<>(tableNames.size());
         for (String tableName : tableNames) {
             if (isSystemTable(tableName)) {
@@ -249,7 +252,8 @@ public class SchemaService {
                 }
                 TableInfo info = new TableInfo(tableName);
                 for (Map<?, ?> row : rowMaps(executor.executeRaw(conn, detailSql, Arrays.asList(schema, tableName)))) {
-                    ColumnInfo col = toColumnInfo(row, mysql, pkCols, comments);
+                    ColumnInfo col = toColumnInfo(row, mysql, pkCols, comments,
+                            identityByTable == null ? null : identityByTable.get(tableName));
                     if (col != null) {
                         info.getColumns().add(col);
                     }
@@ -310,6 +314,7 @@ public class SchemaService {
                 executor.executeRaw(conn, dialect.schemaAllColumnsQuery(), Collections.singletonList(schema)));
 
         Map<String, Map<String, Boolean>> pkByTable = null;
+        Map<String, Map<String, Boolean>> identityByTable = loadIdentityByTable(conn, dialect, schema, mysql);
         Map<String, Map<String, String>> commentByTable = null;
         boolean enrichWarned = false;
         if (!mysql) {
@@ -348,8 +353,9 @@ public class SchemaService {
                 TableInfo info = new TableInfo(tableName);
                 Map<String, Boolean> pkCols = pkByTable == null ? null : pkByTable.get(tableName);
                 Map<String, String> comments = commentByTable == null ? null : commentByTable.get(tableName);
+                Map<String, Boolean> identityCols = identityByTable == null ? null : identityByTable.get(tableName);
                 for (Map<?, ?> row : colRowsByTable.getOrDefault(tableName, Collections.emptyList())) {
-                    ColumnInfo col = toColumnInfo(row, mysql, pkCols, comments);
+                    ColumnInfo col = toColumnInfo(row, mysql, pkCols, comments, identityCols);
                     if (col != null) {
                         info.getColumns().add(col);
                     }
@@ -372,6 +378,7 @@ public class SchemaService {
         String detailSql = dialect.schemaColumnDetailQuery();
         String pkSql = mysql ? null : dialect.schemaPkColumnsQuery();
         String commentSql = mysql ? null : dialect.schemaColumnCommentQuery();
+        Map<String, Map<String, Boolean>> identityByTable = loadIdentityByTable(conn, dialect, schema, mysql);
         boolean enrichWarned = false;
         int truncated = 0;
 
@@ -411,7 +418,8 @@ public class SchemaService {
                     }
                 }
                 for (Map<?, ?> row : rowMaps(executor.executeRaw(conn, detailSql, Arrays.asList(schema, tableName)))) {
-                    ColumnInfo col = toColumnInfo(row, mysql, pkCols, comments);
+                    ColumnInfo col = toColumnInfo(row, mysql, pkCols, comments,
+                            identityByTable == null ? null : identityByTable.get(tableName));
                     if (col != null) {
                         info.getColumns().add(col);
                     }
@@ -427,26 +435,126 @@ public class SchemaService {
         return new ArrayList<>(byName.values());
     }
 
-    /** 字典行 → ColumnInfo（MySQL 语义行 / DM·神通语义行共用；主键、注释来自增强映射或行内字段）。 */
-    private ColumnInfo toColumnInfo(Map<?, ?> row, boolean mysql, Map<String, Boolean> pkCols, Map<String, String> comments) {
+    /**
+     * 全库自增列映射（表名 → 表内列名规范化集合），供逐表/局部刷新路径共用。
+     *
+     * <p>自增标识只能整库拉（DM 走系统表 syscolumns，无法按表过滤），一次查询后在内存按表名取子集。
+     * MySQL 详情查询自带 extra=auto_increment，无需本条；方言不支持或查询失败返回 null
+     * （autoIncrement 保持未探测=null，与旧行为一致，不影响主流程）。
+     */
+    private Map<String, Map<String, Boolean>> loadIdentityByTable(DatabaseConnection conn, Dialect dialect,
+                                                                  String schema, boolean mysql) {
+        if (mysql) {
+            return null;
+        }
+        String sql = dialect.schemaAllIdentityColumnsQuery();
+        if (sql == null) {
+            return null;
+        }
+        try {
+            return groupNameSetByTable(executor.executeRaw(conn, sql, Collections.singletonList(schema)));
+        } catch (Exception e) {
+            log.warn("[SchemaService] 自增增强查询失败将降级 dbType={}: {}", conn.getDbType(), e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 字典行 → ColumnInfo（MySQL 语义行 / DM·神通语义行共用；主键、注释、自增来自增强映射或行内字段）。
+     *
+     * <p>类型文本：MySQL 的 column_type 自带长度精度；DM/神通字典只给裸类型名，需按
+     * char_length / data_precision / data_scale 还原（见 {@link #composeType}），否则
+     * 下游生成的 MySQL 风格 DDL 会出现「VARCHAR 无长度」这类非法定义。
+     */
+    private ColumnInfo toColumnInfo(Map<?, ?> row, boolean mysql, Map<String, Boolean> pkCols,
+                                    Map<String, String> comments, Map<String, Boolean> identityCols) {
         String column = str(row, "column_name");
         if (column == null) {
             return null;
         }
         String type = firstNonNull(str(row, "column_type"), str(row, "data_type"));
+        if (!mysql) {
+            type = composeType(type, str(row, "char_length"), str(row, "data_length"),
+                    str(row, "data_precision"), str(row, "data_scale"));
+        }
         ColumnInfo col = new ColumnInfo(column, type);
         if (mysql) {
             col.setNullable(!isNo(firstNonNull(str(row, "is_nullable"), str(row, "nullable"))));
             col.setPrimaryKey("PRI".equalsIgnoreCase(str(row, "column_key")));
             col.setAutoIncrement(containsIgnoreCase(str(row, "extra"), "auto_increment"));
             col.setComment(str(row, "column_comment"));
+            col.setDefaultValue(str(row, "column_default"));
         } else {
             col.setNullable(nullableOrNull(firstNonNull(str(row, "is_nullable"), str(row, "nullable"))));
             col.setPrimaryKey(pkCols == null ? null : pkCols.containsKey(norm(column)));
-            col.setAutoIncrement(null);
+            col.setAutoIncrement(identityCols == null ? null : identityCols.containsKey(norm(column)));
             col.setComment(comments == null ? null : comments.get(norm(column)));
+            col.setDefaultValue(str(row, "data_default"));
         }
         return col;
+    }
+
+    /** 需要「长度」参数的类型（DM/神通字典 char_length 给出声明长度）。 */
+    private static final Set<String> LENGTH_TYPES = new HashSet<>(Arrays.asList(
+            "CHAR", "CHARACTER", "VARCHAR", "VARCHAR2", "NCHAR", "NVARCHAR", "NVARCHAR2",
+            "CHARACTER VARYING", "NCHAR VARYING", "BINARY", "VARBINARY", "RAW"));
+
+    /** 需要「精度[,标度]」参数的类型。 */
+    private static final Set<String> PRECISION_TYPES = new HashSet<>(Arrays.asList(
+            "NUMBER", "NUMERIC", "DECIMAL", "DEC"));
+
+    /**
+     * DM/神通裸类型名 → 带长度/精度的完整类型文本（已带括号或字典未给参数时原样返回）。
+     *
+     * <p>例：VARCHAR + char_length=255 → {@code VARCHAR(255)}；NUMBER + precision=10, scale=2 →
+     * {@code NUMBER(10,2)}。整型/时间/大对象等不需要参数的类型保持不变。
+     *
+     * <p>长度取值：优先 char_length（DM/神通对 VARCHAR2 等给出字符长度）；为 0/缺失时退回
+     * data_length —— 实测达梦 NCHAR/NVARCHAR2 的 char_length 恒为 0，而 data_length 按 UTF-8
+     * 最坏 4 字节/字符计（湖南 NVARCHAR2(100 CHAR)→400、福建 NVARCHAR2(50 CHAR)→200，
+     * 两库样本一致），故 N 系列取 data_length/4 还原声明字符数；非 N 系列 data_length 即声明长度。
+     */
+    static String composeType(String type, String charLength, String dataLength, String precision, String scale) {
+        if (type == null) {
+            return null;
+        }
+        String t = type.trim();
+        if (t.indexOf('(') >= 0) {
+            return t;
+        }
+        String upper = t.toUpperCase();
+        String args = null;
+        if (LENGTH_TYPES.contains(upper)) {
+            Long n = asLong(charLength);
+            if (n == null || n <= 0) {
+                Long bytes = asLong(dataLength);
+                if (bytes != null && bytes > 0) {
+                    n = upper.startsWith("N") ? Math.max(1, bytes / 4) : bytes;
+                }
+            }
+            if (n != null && n > 0) {
+                args = String.valueOf(n);
+            }
+        } else if (PRECISION_TYPES.contains(upper)) {
+            Long p = asLong(precision);
+            if (p != null && p > 0) {
+                Long s = asLong(scale);
+                args = (s != null && s > 0) ? p + "," + s : String.valueOf(p);
+            }
+        }
+        return args == null ? t : t + "(" + args + ")";
+    }
+
+    /** 宽松数字解析（字典返回可能是 Long / BigDecimal / 字符串）。 */
+    private static Long asLong(String v) {
+        if (v == null || v.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return (long) Double.parseDouble(v.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /** 执行结果 rows（过滤非 Map 行），保持行序。 */
