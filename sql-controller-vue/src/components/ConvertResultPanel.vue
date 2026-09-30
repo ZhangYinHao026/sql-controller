@@ -1,6 +1,7 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { highlightSql } from '../utils/sqlHighlight'
+import { syncCodeGutter } from '../utils/codeGutter'
 
 /**
  * 单方言转换结果面板：按方言元数据着色，内部含双层高亮代码框（可编辑）。
@@ -33,6 +34,37 @@ function syncScroll(e) {
         pre.scrollLeft = e.currentTarget.scrollLeft
     }
 }
+
+/* 双层代码框换行对齐：textarea 出现竖滚动条后其内容区会变窄，让高亮层同步让出该宽度。
+   否则转换结果一长就「选中错乱」（看到的字与实际选中位置对不上）。 */
+function syncGutter() {
+    syncCodeGutter(code.value, code.value?.querySelector('.rp-ta'))
+}
+// 结果文本由父组件异步写入，nextTick 时浏览器可能尚未完成布局 → 再等一帧补量一次
+function scheduleGutterSync() {
+    nextTick(() => {
+        syncGutter()
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(syncGutter)
+    })
+}
+let ro = null
+function observeGutter() {
+    if (typeof ResizeObserver !== 'function') return
+    if (!ro) ro = new ResizeObserver(syncGutter)
+    ro.disconnect()
+    if (code.value) ro.observe(code.value)            // 面板宽度随网格重排/窗口缩放变化
+    const ta = code.value?.querySelector('.rp-ta')
+    if (ta) ro.observe(ta)                            // 滚动条出现/消失会改变其内容区宽度，必然触发
+}
+onMounted(() => {
+    syncGutter()
+    observeGutter()
+    if (typeof ResizeObserver !== 'function') window.addEventListener('resize', syncGutter)
+})
+onBeforeUnmount(() => {
+    if (ro) ro.disconnect()
+    else window.removeEventListener('resize', syncGutter)
+})
 function onCopy() {
     if (props.modelValue) emit('copy', props.modelValue)
 }
@@ -47,7 +79,12 @@ watch(() => props.status, s => {
         const pre = code.value.parentElement?.querySelector('.rp-hl')
         if (pre) pre.scrollTop = 0
     }
+    // 骨架屏 ↔ 代码框切换会重建 textarea → 重新挂观察并补量一次
+    scheduleGutterSync()
+    nextTick(observeGutter)
 })
+// 结果文本变化（转换返回 / 手动编辑）后行数与滚动条都会变
+watch(() => props.modelValue, () => scheduleGutterSync())
 </script>
 
 <template>
@@ -144,7 +181,7 @@ watch(() => props.status, s => {
 }
 .rp-error { margin: 8px 12px 0; font-size: 12px; color: #B95A5A; background: #FDF0F0; border-radius: 8px; padding: 5px 10px; }
 
-.rp-code { position: relative; flex: 1; min-height: 130px; display: flex; }
+.rp-code { position: relative; flex: 1; min-height: 130px; display: flex; --sbw: 0px; }
 .rp-hl, .rp-ta {
     font-family: var(--font-mono);
     font-size: 12.5px;
@@ -158,6 +195,9 @@ watch(() => props.status, s => {
 }
 .rp-hl {
     position: absolute; inset: 0;
+    /* 关键：让出 textarea 竖向滚动条的占宽，与 .rp-ta 的内容区严格对齐，
+       否则结果一长（出现滚动条）两层换行点错开，选中会「错乱」 */
+    padding-right: calc(13px + var(--sbw, 0px));
     background: linear-gradient(180deg, #FFFDF7, #FFF8E8);
     color: var(--ink-900);
     overflow: hidden;

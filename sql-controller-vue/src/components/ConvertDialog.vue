@@ -1,8 +1,9 @@
 <script setup>
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { highlightSql } from '../utils/sqlHighlight'
 import { formatSql } from '../utils/sqlFormat'
+import { syncCodeGutter } from '../utils/codeGutter'
 import { DB_REGISTRY, CONVERT_TARGETS, typeLabel } from '../utils/dbRegistry'
 import ConvertResultPanel from './ConvertResultPanel.vue'
 
@@ -180,6 +181,8 @@ function autoSize(el) {
     if (!el) return
     el.style.height = 'auto'
     el.style.height = Math.max(el.scrollHeight, MIN_INPUT) + 'px'
+    // 高度定下来即知是否出现竖向滚动条：让高亮层同步让出该宽度，保证两层换行点一致
+    syncCodeGutter(el.closest('.convert-code'), el)
 }
 function syncScroll(e) {
     const box = e.currentTarget.closest('.convert-code')
@@ -190,12 +193,19 @@ function syncScroll(e) {
     }
 }
 
+// 弹窗宽度随视口变化 → 换行点与滚动条都会变，重新量一次
+function onResize() { if (inputArea.value) autoSize(inputArea.value) }
+
 watch(() => props.show, async v => {
     if (v) {
         await nextTick()
         if (inputArea.value) autoSize(inputArea.value)
+        window.addEventListener('resize', onResize)
+    } else {
+        window.removeEventListener('resize', onResize)
     }
 })
+onBeforeUnmount(() => window.removeEventListener('resize', onResize))
 </script>
 
 <template>
@@ -334,7 +344,7 @@ watch(() => props.show, async v => {
 .ex-chip:hover { border-color: var(--mint-300); color: var(--mint-700); transform: translateY(-1px); }
 
 /* 双层代码框 */
-.convert-code { position: relative; border-radius: var(--r-xs); }
+.convert-code { position: relative; border-radius: var(--r-xs); --sbw: 0px; }
 .convert-highlight,
 .convert-input {
     font-family: var(--font-mono);
@@ -354,7 +364,12 @@ watch(() => props.show, async v => {
 .convert-highlight {
     position: absolute;
     inset: 0;
-    border: 0;
+    /* 与 textarea 的 1px 边框等宽（透明，被上层 textarea 的边框盖住，视觉无差），
+       使其内容区起点与可用宽度和 textarea 完全一致 */
+    border: 1px solid transparent;
+    /* 关键：textarea 出现竖向滚动条后内容区会窄一个滚动条宽度，高亮层必须同步让出，
+       否则两层换行点错开 —— 表现为「SQL 超过一屏、出现滚动条后选中错乱」 */
+    padding-right: calc(12px + var(--sbw, 0px));
     background: linear-gradient(180deg, #FFFDF7, #FFF8E8);
     color: var(--ink-900);
     overflow: hidden;
