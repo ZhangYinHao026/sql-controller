@@ -162,23 +162,32 @@ export function guessDefault(type) {
   return "''"
 }
 
-/** 生成 MySQL 风格 ADD COLUMN 列定义（不含 'ADD COLUMN' 前缀）。 */
-export function genAdd(f, notes) {
-  let s = '`' + f.name + '` ' + f.type
-  const isText = /TEXT|BLOB|CLOB|JSON|XML/i.test(f.type)
+/**
+ * 生成 MySQL 风格 ADD COLUMN 列定义（不含 'ADD COLUMN' 前缀）。
+ *
+ * @param opts 可选 {targetType, table}：目标库 dbType —— 目标为 MySQL 时把基准库的
+ *             达梦/神通类型名整备成 MySQL 等价名（见 {@link typeForTarget}）。
+ */
+export function genAdd(f, notes, opts) {
+  const type = typeForTarget(f, opts && opts.table, opts && opts.targetType, notes)
+  let s = '`' + f.name + '` ' + type
+  const isText = /TEXT|BLOB|CLOB|JSON|XML/i.test(type)
   const noDefault = f.default === undefined || f.default === null
   if (f.notNull) {
-    if (noDefault && !isText) { const d = guessDefault(f.type); s += ' NOT NULL DEFAULT ' + d; notes.push('列 `' + f.name + '` NOT NULL 且无默认值，已按类型兜底 DEFAULT ' + d + '（请核对取值）') }
-    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + f.name + '` 为 ' + f.type + ' 且 NOT NULL，MySQL 文本列无法加默认值，已退化为可空 NULL（请人工确认）') }
+    if (noDefault && !isText) { const d = guessDefault(type); s += ' NOT NULL DEFAULT ' + d; notes.push('列 `' + f.name + '` NOT NULL 且无默认值，已按类型兜底 DEFAULT ' + d + '（请核对取值）') }
+    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + f.name + '` 为 ' + type + ' 且 NOT NULL，文本列无法加默认值，已退化为可空 NULL（请人工确认）') }
     else { s += ' NOT NULL'; if (!noDefault) s += ' DEFAULT ' + lit(f.default) }
   } else if (!noDefault) s += ' DEFAULT ' + lit(f.default)
   if (f.comment) s += ' COMMENT ' + sqlStr(f.comment)
   return s
 }
 
-/** 生成 MySQL 风格 MODIFY COLUMN 列定义（保留目标已有注释，防止 MODIFY 清空）。 */
-export function genMod(l, r) {
-  let s = '`' + l.name + '` ' + l.type
+/**
+ * 生成 MySQL 风格 MODIFY COLUMN 列定义（保留目标已有注释，防止 MODIFY 清空）。
+ * @param opts 可选 {targetType, table}：类型整备规则同 {@link genAdd}。
+ */
+export function genMod(l, r, notes, opts) {
+  let s = '`' + l.name + '` ' + typeForTarget(l, opts && opts.table, opts && opts.targetType, notes)
   s += l.notNull ? ' NOT NULL' : ' NULL'
   if (l.default !== undefined && l.default !== null) s += ' DEFAULT ' + lit(l.default)
   const cmt = (l.comment !== undefined && l.comment !== '') ? l.comment : r.comment
@@ -222,6 +231,31 @@ export function toMysqlType(f, table) {
     }
   }
   return { type: t, hints }
+}
+
+/**
+ * 按**目标库类型**整备列类型表达式（生成补丁用）。
+ *
+ * <p>目标 MySQL：基准库可能是达梦/神通，其字典给出的 VARCHAR2/NUMBER/CLOB 等名字在 MySQL 下
+ * 非法（Error 1064）——复用 {@link toMysqlType} 转成等价 MySQL 名并补长度/精度兜底；
+ * 目标为非 MySQL 时不能这样改写：达梦/神通认得 VARCHAR2/NUMBER，改写反而丢语义。
+ *
+ * <p>目标 DM/神通：类型保持基准库原样 —— 该方向的方言改写（类型名、MODIFY 拆句、注释语句）
+ * 统一交给后端转换器在生成/执行时完成，避免在 JS 侧重复维护一份方言映射表。
+ *
+ * @param f          引擎列（需 name/type）
+ * @param table      表名（仅用于兜底提示文案）
+ * @param targetType 目标库 dbType：mysql | dm | oscar（空/未知按 mysql 处理）
+ * @param notes      可选，收集类型转写/兜底提示
+ * @returns 类型表达式（含长度精度）
+ */
+export function typeForTarget(f, table, targetType, notes) {
+  if (!f) return ''
+  const target = String(targetType || 'mysql').toLowerCase()
+  if (target !== 'mysql') return String(f.type == null ? '' : f.type)
+  const tt = toMysqlType(f, table)
+  if (notes && tt.hints.length) tt.hints.forEach(h => notes.push(h))
+  return tt.type
 }
 
 /**
@@ -393,20 +427,23 @@ export function statTable(L, R) {
  * @param cmpCols 比对库该表列
  * @param table 表名
  * @param choose (name, kind) => boolean 该列该动作是否勾选
+ * @param opts 可选 {targetType}：目标库 dbType —— 目标 MySQL 时按 MySQL 整备类型名
+ *             （基准库可能是达梦/神通，其 VARCHAR2/NUMBER/CLOB 直发 MySQL 会报错）。
  * @returns {{stmts:string[], notes:string[], adds:number, hasDrop:boolean}}
  *   stmts 为空数组时 notes 说明原因（缺整表 / 基准无此表 / 未勾选）。
  */
-export function stmtsFor(baseCols, cmpCols, table, choose) {
+export function stmtsFor(baseCols, cmpCols, table, choose, opts) {
   const L = baseCols || [], R = cmpCols || []
+  const cOpts = {targetType: (opts && opts.targetType) || 'mysql', table}
   const notes = [], adds = [], drops = [], mods = [], pks = [], dropNames = [], modNames = []
   if (!R.length) return { stmts: [], notes: ['比对库缺少整表 `' + table + '`：请用「SQL 转换」生成建表脚本（字段注释/索引可一并还原）'], adds: 0, hasDrop: false }
   if (!L.length) return { stmts: [], notes: ['基准库无此表，无法对齐'], adds: 0, hasDrop: false }
   colUnion(L, R).forEach(n => {
     const l = L.find(f => eqName(f.name, n)), r = R.find(f => eqName(f.name, n))
     const cs = colStatus(l, r)
-    if (cs.kind === 'add' && choose(n, 'add')) adds.push('ADD COLUMN ' + genAdd(l, notes))
+    if (cs.kind === 'add' && choose(n, 'add')) adds.push('ADD COLUMN ' + genAdd(l, notes, cOpts))
     else if (cs.kind === 'drop' && choose(n, 'drop')) { drops.push('DROP COLUMN `' + n + '`'); dropNames.push(n) }
-    else if (cs.kind === 'alt' && choose(n, 'mod')) { mods.push('MODIFY COLUMN ' + genMod(l, r)); modNames.push(n) }
+    else if (cs.kind === 'alt' && choose(n, 'mod')) { mods.push('MODIFY COLUMN ' + genMod(l, r, notes, cOpts)); modNames.push(n) }
     else if (cs.kind === 'pk') pks.push(n)
   })
   const parts = [...adds, ...drops, ...mods]

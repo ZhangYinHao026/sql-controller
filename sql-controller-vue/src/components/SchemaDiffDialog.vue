@@ -7,14 +7,18 @@
  *     弹窗左侧列出目标库清单（待执行/执行中/已执行/失败），可逐库或「执行全部」统一执行；
  *  2) 执行 = 「▶ 执行到 目标库」，仅向该桶归属库发送（App.runDiffScript 负责切库型/跨方言转换/危险确认），
  *     成功即清空该桶脚本并就地显示状态，失败保留可重试；
- *  3) 跨方言补丁保持 MySQL 风格，由后端 SqlConvertService 翻译（DROP/MODIFY 已支持，P2 完成）。
+ *  3) 生成即按目标库类型整备：目标 MySQL → 列类型按 MySQL 等价名整备（基准是达梦/神通时避免直发报错）；
+ *     目标达梦/神通 → 源脚本保持 MySQL 风格，同时为该桶产出「目标方言视图」（后端 SqlConvertService
+ *     翻译，与执行同一套映射，不重复维护方言表），补丁弹窗默认展示该视图、只读、可复制；
+ *     执行仍按源脚本转换下发 —— 两视图同源同译，结果一致。
  *
  * 数据源：App.vue 传入已保存连接(connections)，本组件按需调 /api/diff/schema-snapshot 抓结构快照
  * （快照缓存在组件实例内，可「⟳ 重抓快照」force 刷新）。
  */
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from 'vue'
 import {api} from '../api'
-import {eqName, genCreateTable, genIndexStmts, indexCols, indexDiff, commentDiff, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, toEngineIndexes, appendOrReplaceBlock} from '../utils/schemaDiff'
+import {eqName, genCreateTable, genIndexStmts, indexCols, indexDiff, commentDiff, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, toEngineIndexes, typeForTarget, appendOrReplaceBlock} from '../utils/schemaDiff'
+import {assembleStatements} from '../utils/sqlStatements'
 import {typeLabel} from '../utils/dbRegistry'
 import ConfirmDialog from './ConfirmDialog.vue'
 import DiffPatchDialog from './DiffPatchDialog.vue'
@@ -37,11 +41,15 @@ const detailOnlyDiff = ref(false)   // 单表核对：仅显示差异字段（�
 const diffState = reactive({})       // `${cmp}|${table}|${field}` -> 'add'|'drop'|'mod'|'skip'|'back'
 const applied = reactive({})         // `${cmp}|${table}` -> true
 /* ---- 补丁：按目标库分桶（每个比对库一桶 + 基准库一桶），生成只累积、可攒批统一执行 ----
- *   key = String(目标库 connectionId)；status: idle(待执行) / running(执行中) / done(成功·已清空文本) / fail(失败·可重试) */
-const patchBuckets = reactive({})        // key -> {id, text, edited, status, info}
+ *   key = String(目标库 connectionId)；status: idle(待执行) / running(执行中) / done(成功·已清空文本) / fail(失败·可重试)
+ *   text = 源脚本（MySQL 风格，可编辑，执行时经转换器按目标库方言翻译）
+ *   dialectText/dialectType/dialectWarn/dialectErr = 「目标方言视图」（目标库非 MySQL 时异步生成，
+ *     由后端转换器产出，补丁弹窗默认展示，只读、可复制 —— 让生成的 SQL 按库类型看得见） */
+const patchBuckets = reactive({})        // key -> {id, text, edited, status, info, dialectText?, dialectType?, dialectWarn?, dialectErr?}
 const patchOrder = ref([])               // 有序 key（列表顺序 = 创建顺序）
 const patchActive = ref(null)            // 弹窗当前选中的 key
 const patchOpen = ref(false)             // 补丁弹窗是否打开
+const dialectTimers = {}                 // key -> 方言视图刷新防抖 timer
 const guard = reactive({show: false, message: '', okText: '继续并清空', danger: true})
 let guardCb = null                       // 确认后执行的回调
 
@@ -113,6 +121,8 @@ function bucketOf(id) {
   return patchBuckets[k]
 }
 function dropBucket(k) {
+  clearTimeout(dialectTimers[k])
+  delete dialectTimers[k]
   if (patchBuckets[k]) delete patchBuckets[k]
   patchOrder.value = patchOrder.value.filter(x => x !== k)
   if (patchActive.value === k) patchActive.value = null
@@ -150,6 +160,7 @@ const patchViews = computed(() => orderedBuckets.value.map(b => ({
   name: libName(b.id),
   roleName: bucketRoleName(b.id),
   dbType: libTypeName(b.id),
+  dialectType: b.dialectType || (libTypeName(b.id) === 'mysql' ? '' : libTypeName(b.id)),
   lines: patchLinesOf(b),
   meta: patchMetaText(b),
   status: b.status,
@@ -163,10 +174,17 @@ const activeBucketView = computed(() => {
   const k = patchActive.value
   const b = k ? patchBuckets[k] : null
   if (!b) return null
+  const dt = b.dialectType || ''
   return {
     key: bucketKey(b.id), name: libName(b.id), roleName: bucketRoleName(b.id), dbType: libTypeName(b.id),
     text: b.text, lines: patchLinesOf(b), meta: patchMetaText(b), status: b.status, info: b.info,
     canExec: !!b.text.trim() && b.status !== 'running', edited: b.edited,
+    /* 目标方言视图（目标库非 MySQL 时由转换器产出；见 refreshBucketDialect） */
+    dialectText: b.dialectText || '',
+    dialectType: dt,
+    dialectLabel: dt ? typeLabel(dt) : '',
+    dialectWarn: b.dialectWarn || [],
+    dialectErr: b.dialectErr || '',
     execLabel: `▶ 执行到 ${libName(b.id)}`, dirty: patchHasDrop(b) || patchHasMod(b)
   }
 })
@@ -339,6 +357,7 @@ function guardOk() {
 }
 function guardCancel() { guard.show = false; guardCb = null }
 function clearAllBuckets() {
+  Object.keys(dialectTimers).forEach(k => { clearTimeout(dialectTimers[k]); delete dialectTimers[k] })
   patchOrder.value.forEach(k => { delete patchBuckets[k] })
   patchOrder.value = []
   patchActive.value = null
@@ -429,11 +448,50 @@ function onRowChoice({name, kind, on}) {
 }
 /** 追加补丁到指定目标库的桶。桶按库隔离、天然不混库；同一目标库内同一表重复生成时**替换原 block**，
  *  避免 SQL 叠加重复执行。追加不自动弹窗：内容进「📋 补丁脚本」入口（徽章计数），可攒批后统一执行。 */
+/* ---- 目标方言视图（生成即按目标库类型可见） ----
+ * 目标库非 MySQL 时，把该桶的 MySQL 风格源脚本整体交给后端转换器（与「▶ 执行」同一套方言映射，
+ * 不在 JS 侧重复维护方言表），产出「该库可直接执行/复制」的方言脚本存进桶，补丁弹窗默认展示。
+ * 源脚本仍是唯一可编辑的真相，执行仍按源脚本走 —— 与方言视图同源同译，结果一致。 */
+const DIALECT_DEBOUNCE_MS = 400
+async function refreshBucketDialect(ownerId) {
+  const b = bucketOf(ownerId)
+  const t = String(libTypeName(ownerId) || '').toLowerCase()
+  if (!t || t === 'mysql') { b.dialectText = ''; b.dialectType = ''; b.dialectWarn = []; b.dialectErr = ''; return }
+  const src = b.text
+  b.dialectType = t
+  if (!src.trim()) { b.dialectText = ''; b.dialectWarn = []; b.dialectErr = '（脚本为空）'; return }
+  try {
+    const conv = await api.convertSql(src, t)
+    if (b.text !== src) return            // 期间脚本已变：丢弃本次结果，稍后的刷新会覆盖
+    b.dialectText = assembleStatements(conv && conv.statements)
+    b.dialectWarn = (conv && conv.warnings) || []
+    b.dialectErr = b.dialectText ? '' : '转换后无可用语句（详见「SQL 转换」）'
+  } catch (e) {
+    if (b.text !== src) return
+    b.dialectText = ''
+    b.dialectWarn = []
+    b.dialectErr = '转换失败：' + e.message
+  }
+}
+/** 防抖刷新（编辑时逐键触发，避免每敲一个字就请求一次）。 */
+function refreshBucketDialectSoon(ownerId) {
+  const k = bucketKey(ownerId)
+  clearTimeout(dialectTimers[k])
+  dialectTimers[k] = setTimeout(() => { delete dialectTimers[k]; refreshBucketDialect(ownerId) }, DIALECT_DEBOUNCE_MS)
+}
+/** 清空某桶的方言视图（脚本被清空 / 执行成功已清空后）。 */
+function clearBucketDialect(ownerId) {
+  const b = bucketOf(ownerId)
+  b.dialectText = ''
+  b.dialectWarn = []
+  b.dialectErr = ''
+}
 function patchAppendTo(ownerId, block) {
   const b = bucketOf(ownerId)
   b.text = appendOrReplaceBlock(b.text, block)
   b.edited = false
   if (b.status !== 'running') { b.status = 'idle'; b.info = '' }
+  refreshBucketDialect(ownerId)
 }
 /** 弹窗手工编辑回调：写回当前激活桶并打「已手工修改」标（新键入视为新一轮待执行）。 */
 function onPatchInput(value) {
@@ -443,6 +501,7 @@ function onPatchInput(value) {
   b.edited = true
   if (b.status === 'done' || b.status === 'fail') b.status = 'idle'
   b.info = ''
+  refreshBucketDialectSoon(b.id)
 }
 function genDetail() {
   if (diffCmp.value == null || !diffTable.value) return
@@ -462,14 +521,16 @@ function genDetail() {
     if (fwdOn) return toast(`表 \`${t}\` 同时显式勾选了“向比对库同步”与“补基准库”，两目标库不同无法一次生成；请先取消一侧后重试`)
     const baseName = libName(baseId), cmpName = libName(cmpId)
     const notes = []
-    const parts = backCols.map(r => 'ADD COLUMN ' + addColDef(r.r, notes))
+    const backOpts = {targetType: libTypeName(baseId), table: t}   // 目标库 = 基准库：类型按其类型整备
+    const parts = backCols.map(r => 'ADD COLUMN ' + addColDef(r.r, notes, backOpts))
     const block = `-- 【补基准库】${baseName}（依据比对库 ${cmpName} 补齐缺列）· 表 \`${t}\`\nALTER TABLE \`${t}\` ` + parts.join(', ') + ';'
     patchAppendTo(baseId, block)
     applied[cmpId + '|' + t] = true
     toast(`已将 ${parts.length} 个缺列补丁加入「${bucketRoleName(baseId)}」（目标库：${baseName}），可稍后从 📋 补丁脚本 统一执行`)
     return
   }
-  const res = stmtsFor(fieldsOf(baseId, t), fieldsOf(cmpId, t), t, (n, kind) => choiceOn(cmpId, t, n, kind))
+  const res = stmtsFor(fieldsOf(baseId, t), fieldsOf(cmpId, t), t, (n, kind) => choiceOn(cmpId, t, n, kind),
+    {targetType: libTypeName(cmpId)})
   if (!res.stmts.length) {
     const missing = !hasTbl(cmpId, t)
     const st = missing ? null : statTable(fieldsOf(baseId, t), fieldsOf(cmpId, t))
@@ -494,8 +555,9 @@ function genLibAddsInner(cmpId) {
     const li = colIdxOf(diffBase.value, t), ri = colIdxOf(cmpId, t)
     const empty = { list: [], byUpper: new Map() }
     const adds = []
+    const tOpts = {targetType: libTypeName(cmpId), table: t}   // 类型按目标库整备（目标 MySQL 且基准是达梦/神通时转 MySQL 名）
     mergedColsIx(li || empty, ri || empty).forEach(row => {
-      if (row.cs.kind === 'add') adds.push('ADD COLUMN ' + addColDef(row.l, notes))
+      if (row.cs.kind === 'add') adds.push('ADD COLUMN ' + addColDef(row.l, notes, tOpts))
     })
     if (adds.length) blocks.push('ALTER TABLE `' + t + '` ' + adds.join(', ') + ';')
   })
@@ -510,14 +572,16 @@ function genLibAddsInner(cmpId) {
   })
   toast(`已为「${cmpName}」生成 ${blocks.length} 张表缺列补丁（${patchLinesOf(bucketOf(cmpId))} 行待执行，可从 📋 补丁脚本 查看/统一执行）`)
 }
-function addColDef(f, notes) {
+function addColDef(f, notes, opts) {
   // 与 schemaDiff.genAdd 同语义；此处需独立产出（表级循环没有逐列 stmtsFor choose 上下文）
-  let s = '`' + f.name + '` ' + f.type
-  const isText = /TEXT|BLOB|CLOB|JSON|XML/i.test(f.type)
+  // 类型按**目标库类型**整备：目标 MySQL 且基准是达梦/神通时转等价 MySQL 名（否则直发会报 1064）。
+  const type = typeForTarget(f, opts && opts.table, opts && opts.targetType, notes)
+  let s = '`' + f.name + '` ' + type
+  const isText = /TEXT|BLOB|CLOB|JSON|XML/i.test(type)
   const noDefault = f.default === undefined || f.default === null
   if (f.notNull) {
     if (noDefault && !isText) { s += ' NULL'; notes.push('列 `' + f.name + '` NOT NULL 无默认值，跨方言 ADD 未自动兜底，请人工补 DEFAULT 后执行') }
-    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + f.name + '` 为 ' + f.type + ' 且 NOT NULL，已退化为可空 NULL（请人工确认）') }
+    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + f.name + '` 为 ' + type + ' 且 NOT NULL，已退化为可空 NULL（请人工确认）') }
     else { s += ' NOT NULL'; if (!noDefault) s += ' DEFAULT ' + (typeof f.default === 'number' ? f.default : sqlStr(f.default)) }
   } else if (!noDefault) s += ' DEFAULT ' + (typeof f.default === 'number' ? f.default : sqlStr(f.default))
   if (f.comment) s += ' COMMENT ' + sqlStr(f.comment)
@@ -575,14 +639,21 @@ function clearCurPatch() {
   const b = k ? patchBuckets[k] : null
   if (!b) return toast('当前没有选中的补丁桶')
   b.text = ''; b.edited = false; b.status = 'idle'; b.info = ''
+  clearBucketDialect(b.id)
   toast(`已清空「${libName(b.id)}」补丁`)
 }
-function copyCurPatch() {
+/** 复制当前查看的脚本：mode='dialect' = 目标方言语（该库可直接执行），'source' = MySQL 风格源脚本。 */
+function copyCurPatch(mode) {
   const k = patchActive.value
   const b = k ? patchBuckets[k] : null
-  if (!b || !b.text.trim()) return toast('补丁为空，请先生成')
-  navigator.clipboard?.writeText(b.text.trim()).catch(() => {})
-  toast(`${libName(b.id)} 补丁 SQL 已复制`)
+  if (!b) return toast('当前没有选中的补丁桶')
+  const useDialect = mode === 'dialect' && b.dialectText && b.dialectText.trim()
+  const text = useDialect ? b.dialectText.trim() : b.text.trim()
+  if (!text) return toast('补丁为空，请先生成')
+  navigator.clipboard?.writeText(text).catch(() => {})
+  toast(useDialect
+    ? `${libName(b.id)} 补丁 SQL（${typeLabel(String(b.dialectType || '').toLowerCase())} 方言）已复制`
+    : `${libName(b.id)} 补丁 SQL（MySQL 风格）已复制`)
 }
 function runCurPatch() {
   const k = patchActive.value
@@ -607,6 +678,7 @@ function runBucket(id) {
           b.status = 'done'
           b.info = `✓ ${new Date().toLocaleTimeString('zh-CN', {hour12: false})} 执行成功` + (res.rows != null ? ` · ${res.rows} 行受影响` : '') + ` · ${used}s`
           b.text = ''; b.edited = false   // 已执行到库不再保留，防残留重复执行；状态保留可回溯
+          clearBucketDialect(id)          // 脚本已清空 → 方言视图一并清掉
           toast(`已执行到 ${libName(id)} 成功，该库补丁已清空`)
           refreshTablesAfterExec(id, sqlText)
         } else {
@@ -1057,7 +1129,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
           <span v-for="g in dbTypeGroups" :key="'g' + g.type" class="diff-cmp-group">
             <b>{{ g.typeName }}</b>
             <label v-for="c in g.list" :key="c.id" :class="{ cross: c.dbType !== baseType, 'failed-lib': !!libs[c.id]?.error }"
-                   :title="libs[c.id]?.error ? '快照失败：' + libs[c.id].error : (c.dbType !== baseType ? '跨方言库：补丁保持 MySQL 风格，执行时经 SQL 转换器翻译' : '')">
+                   :title="libs[c.id]?.error ? '快照失败：' + libs[c.id].error : (c.dbType !== baseType ? '跨方言库：生成时按该库方言产出补丁（补丁弹窗默认展示已转换的目标方言脚本），执行按源脚本经转换器下发' : '')">
               <input type="checkbox" :disabled="fetching || !!libs[c.id]?.error" :checked="diffCmps.includes(c.id)"
                      @change="toggleCmp(c.id, $event.target.checked)">
               {{ c.regionName }}<span v-if="libs[c.id]?.error" class="fail-mark">✗</span>
@@ -1111,7 +1183,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
         <div class="diff-detail">
           <!-- ============ 差异总览 ============ -->
           <div v-show="diffMode === 'summary'" class="diff-view">
-            <div class="diff-ov-hint">核对方向：基准库 → 比对库。安全默认：<b>只自动补「缺列」</b>；多列删除、类型/约束改写、主键差异均需人工确认。生成只累积不打断：脚本按<b>目标库分桶</b>（各比对库 + 基准库），点「📋 补丁脚本」查看每库脚本并逐库 / 统一执行，执行状态就地可见。跨方言库的补丁保持 MySQL 风格，执行时经 SQL 转换器翻译（同型直发）。</div>
+            <div class="diff-ov-hint">核对方向：基准库 → 比对库。安全默认：<b>只自动补「缺列」</b>；多列删除、类型/约束改写、主键差异均需人工确认。生成只累积不打断：脚本按<b>目标库分桶</b>（各比对库 + 基准库），点「📋 补丁脚本」查看每库脚本并逐库 / 统一执行，执行状态就地可见。生成即按<b>目标库类型</b>整备：目标库为达梦/神通时，补丁弹窗默认展示已转换的<b>目标方言脚本</b>（可复制直接执行），也可切到「源脚本」编辑；执行按源脚本经转换器下发，两者一致。</div>
             <div class="diff-ov-cards">
               <div v-if="!diffCmps.length" class="ov-empty">请至少勾选一个比对库</div>
               <article v-for="card in ovCards" :key="card.id" class="ov-card">
