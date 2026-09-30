@@ -10,6 +10,7 @@ import { tags } from '@lezer/highlight'
 import { formatSql } from '../utils/sqlFormat'
 import { paramDecoration } from '../utils/paramDecoration'
 import { loadAutocompleteSchema, toCM6Schema } from '../utils/autocompleteSchema'
+import { keywordFilteredCompletionSource, businessCompletionSource } from '../utils/sqlWords'
 
 const props = defineProps({
   modelValue: { type: String, required: true },
@@ -169,7 +170,12 @@ onMounted(async () => {
         history(),
         /* 语言扩展用 Compartment 包裹：初始纯 MySQL；schema 注入后 reconfigure 替换为带 schema 版本 */
         schemaCompartment.of(sql({ dialect: MySQL })),
-        autocompletion({ activateOnTyping: true }),
+        /* 联想：override 屏蔽 lang-sql 自带的「跨方言大词表」，
+           用白名单过滤后的源替代（表/列/函数照常，见 utils/sqlWords.js），再叠加业务补充词 */
+        autocompletion({
+          activateOnTyping: true,
+          override: [keywordFilteredCompletionSource, businessCompletionSource]
+        }),
         keymap.of([...defaultKeymap, ...completionKeymap, ...historyKeymap, {
           /* Tab：联想菜单打开且选中项时接受（与回车一致）；否则回落到缩进；Shift+Tab 反缩进 */
           key: 'Tab',
