@@ -825,16 +825,38 @@ function diffParts(s) {
   if (s.missing) p.push({t: '缺表' + s.missing, cls: 'missing'})
   return p
 }
-/** 单表核对 pills：纯库名切换按钮（差异统计已全部移除，仅 title 悬浮保留明细提示）。 */
+/** 单表核对 pills：库名 + 跟随左栏选中表的「该库自身差异」徽章（左栏徽章仍是跨库汇总，
+ *  这里回答的是「这张表到底是哪个库差、差什么」）。未选表时退化为纯库名。 */
 const cmpPillViews = computed(() => diffCmps.value.map(id => {
-  const s = cmpEntry(id).sums
-  const parts = diffParts(s)
-  return {
-    id,
-    name: libName(id),
-    title: parts.length ? parts.map(p => p.t).join(' · ') + `（相对基准 ${libName(diffBase.value)}）` : '与基准完全一致'
+  const t = diffTable.value
+  const tbl = t ? cmpTableBadge(id, t) : null
+  let title
+  if (tbl) {
+    title = tbl.parts.length
+      ? `表 ${t}：` + tbl.parts.map(p => p.t).join(' · ') + `（相对基准 ${libName(diffBase.value)}）`
+      : `表 ${t}：与基准一致`
+  } else {
+    const parts = diffParts(cmpEntry(id).sums)
+    title = parts.length ? parts.map(p => p.t).join(' · ') + `（相对基准 ${libName(diffBase.value)}）` : '与基准完全一致'
   }
+  return { id, name: libName(id), tbl, title }
 }))
+/** 某比对库在指定表上的自身差异（口径与左栏 badgeFor 一致，只是不跨库求和）。
+ *  返回 {cls, parts:[{t,cls}]}；全一致 → parts 空；该库无快照 → null（pill 不显示徽章）。 */
+function cmpTableBadge(id, t) {
+  const lib = libs[id]
+  if (!lib || lib.error || !lib.fetchedAt) return null
+  if (!hasTbl(diffBase.value, t)) {
+    // 基准没有的表（比对库独有）：该库有 → 多 N 列；该库也没有 → 缺表
+    if (!hasTbl(id, t)) return { cls: 'missing', parts: [{ t: '缺表', cls: 'missing' }] }
+    return { cls: 'drop', parts: [{ t: '多' + fieldsOf(id, t).length, cls: 'drop' }] }
+  }
+  if (!hasTbl(id, t)) return { cls: 'missing', parts: [{ t: '缺表', cls: 'missing' }] }
+  const hit = cmpEntry(id).byT.get(tableRealKey(diffBase.value, t))
+  const s = hit && !hit.missing ? hit.st : statTable(fieldsOf(diffBase.value, t), fieldsOf(id, t))
+  const parts = diffParts(s)
+  return parts.length ? { cls: parts[0].cls, parts } : { cls: 'ok', parts: [] }
+}
 /** 比对库勾选 label 上的微型差异徽章（该库 vs 基准，未拉快照/失败返回 null）。 */
 function cmpMini(id) {
   const lib = libs[id]
@@ -1245,7 +1267,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
               <span class="pill-label">比对库:</span>
               <button v-for="v in cmpPillViews" :key="v.id" type="button" class="diff-cmp-pill"
                       :class="{ active: v.id === diffCmp }" :title="v.title" @click="selectCmp(v.id)">
-                {{ v.name }}
+                {{ v.name }}<template v-if="v.tbl"><span v-for="(p, i) in v.tbl.parts" :key="i"
+                  class="pill-part" :class="p.cls">{{ p.t }}</span><span v-if="!v.tbl.parts.length"
+                  class="pill-part ok" title="该库此表与基准一致">✓</span></template>
               </button>
               <span v-if="!cmpPillViews.length" class="muted">无</span>
               <label class="diff-only d-only" title="隐藏字段类型/约束完全一致的行，只看有差异的字段">
@@ -1476,8 +1500,16 @@ export default { name: 'SchemaDiffDialog' }
 .missing-table .mt-actions .btn.primary { margin-left: 0; }
 
 .diff-cmp-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; flex: 0 0 auto; }
-.diff-cmp-pill { border: 1.5px solid var(--ink-100); border-radius: var(--r-pill); padding: 3px 12px; font-size: 12px; font-weight: 700; background: var(--surface); color: var(--ink-500); cursor: pointer; }
+.diff-cmp-pill { border: 1.5px solid var(--ink-100); border-radius: var(--r-pill); padding: 3px 12px; font-size: 12px; font-weight: 700; background: var(--surface); color: var(--ink-500); cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
 .diff-cmp-pill.active { background: var(--mint-100); border-color: var(--mint-300); color: var(--mint-700); }
+/* pill 上跟随选中表的「该库自身差异」小徽章（配色与左栏 .diff-tbadge 一致） */
+.pill-part { font-size: 10px; font-weight: 800; padding: 0 5px; border-radius: 4px; line-height: 15px; flex: 0 0 auto; }
+.pill-part.add { background: #FDEBD9; color: #A76A12; }
+.pill-part.drop { background: #FFE4EC; color: #C2525F; }
+.pill-part.alt { background: #E3EEFB; color: #3E6DA8; }
+.pill-part.pk { background: #F1E7F7; color: #83539E; }
+.pill-part.missing { background: #F5E3E0; color: #A84A3F; }
+.pill-part.ok { background: var(--mint-100); color: var(--mint-600); }
 .pill-label { font-size: 12px; color: var(--ink-500); font-weight: 700; }
 .d-only { margin-left: auto; }
 .diff-wrap { border: 1px solid var(--ink-100); border-radius: 10px; overflow: hidden; background: var(--surface); display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
