@@ -178,6 +178,8 @@ const activeBucketView = computed(() => {
   return {
     key: bucketKey(b.id), name: libName(b.id), roleName: bucketRoleName(b.id), dbType: libTypeName(b.id),
     text: b.text, lines: patchLinesOf(b), meta: patchMetaText(b), status: b.status, info: b.info,
+    /* hasText 必须给（弹窗按它判定「清空补丁 / 复制」是否可用）——漏了会让两个按钮永久禁用 */
+    hasText: !!b.text.trim(),
     canExec: !!b.text.trim() && b.status !== 'running', edited: b.edited,
     /* 目标方言视图（目标库非 MySQL 时由转换器产出；见 refreshBucketDialect） */
     dialectText: b.dialectText || '',
@@ -683,7 +685,7 @@ function runBucket(id) {
           refreshTablesAfterExec(id, sqlText)
         } else {
           b.status = 'fail'
-          b.info = `✗ ${new Date().toLocaleTimeString('zh-CN', {hour12: false})} 执行失败 · ${(res && res.error) || '未知错误（详见主区结果）'} · 可重试`
+          b.info = `✗ ${new Date().toLocaleTimeString('zh-CN', {hour12: false})} 执行失败 · ${(res && res.error) || '未知错误（详见主区结果）'} · 可编辑脚本后重试`
         }
         resolve(ok)
       }
@@ -1368,7 +1370,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
 
   <DiffPatchDialog :show="patchOpen" :items="patchViews" :active="activeBucketView" :busy="anyRunning"
                    @close="closePatch" @select="selectBucket" @input="onPatchInput"
-                   @clear="clearCurPatch" @copy="copyCurPatch" @run="runCurPatch" @run-all="runAllPending"/>
+                   @clear="clearCurPatch" @copy="copyCurPatch" @run="runCurPatch" @run-all="runAllPending"
+                   @toast="toast"/>
   <ConfirmDialog mode="generic" title="补丁操作确认" :message="guard.message" :confirm-text="guard.okText"
                  :danger="guard.danger" :show="guard.show" @confirm="guardOk" @cancel="guardCancel"/>
 </template>

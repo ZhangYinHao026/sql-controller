@@ -8,7 +8,10 @@
  *
  * 目标库非 MySQL（达梦/神通）时右侧多一个「目标方言」视图：由 SchemaDiffDialog 侧调转换器
  * 生成（父级注入 dialectText/dialectLabel/dialectWarn/dialectErr），**默认展示**、只读、可复制，
- * 让「按目标库类型生成的那份 SQL」直接看得见、拿得走；要改脚本切回「源脚本」编辑。
+ * 让「按目标库类型生成的那份 SQL」直接看得见、拿得走。
+ * **只读视图不是死路**（2026-10-13 起）：点只读区 / 点「✎ 去编辑」/ 点提示行链接都会自动切到
+ * 可编辑的「源脚本」；「清空补丁」在两种视图下都可用（清空源脚本 ⇒ 方言视图一并清空）；
+ * 某桶执行失败后，切到该桶或失败当刻都**自动停在不只读的「源脚本」**，方便改一行再重试。
  * 执行始终按源脚本走（父级按目标库类型转换），因此两个视图同源同译、结果一致。
  *
  * 状态（text / edited / status / info）由 SchemaDiffDialog 持有并注入：
@@ -25,7 +28,7 @@ const props = defineProps({
   active: { type: Object, default: null },      // 当前选中桶视图（null = 未选中）
   busy: Boolean                                 // 任一桶执行中
 })
-const emit = defineEmits(['close', 'select', 'input', 'clear', 'copy', 'run', 'run-all'])
+const emit = defineEmits(['close', 'select', 'input', 'clear', 'copy', 'run', 'run-all', 'toast'])
 
 const pending = computed(() => props.items.filter(it => it.hasText && it.status !== 'running'))
 const runAllLabel = computed(() => `执行全部（${pending.value.length} 库）`)
@@ -37,9 +40,19 @@ const shownText = computed(() => {
   if (!props.active) return ''
   return viewingDialect.value ? (props.active.dialectText || '') : props.active.text
 })
-const emptyEditor = computed(() => !props.active || !(viewingDialect.value ? props.active.dialectText : props.active.hasText))
-/* 换桶回到方言视图（默认姿势） */
-watch(() => props.active && props.active.key, () => { showDialect.value = true })
+/** 清空 / 复制是否可用：只看**源脚本**有没有内容（方言视图为空可能只是转换失败，不该连清空都点不了）。 */
+const canOps = computed(() => !!(props.active && props.active.hasText))
+/* 换桶：默认看方言视图；**失败桶**例外 → 直接停在可编辑的源脚本（失败大多要手工改一行再重试） */
+watch(() => props.active && props.active.key, () => { showDialect.value = !(props.active && props.active.status === 'fail') })
+/* 同一桶内刚执行失败：自动切到可编辑源脚本。只单向「失败→源脚本」，所以用户随后编辑把状态改回
+ * idle 时不会被弹回只读视图。 */
+watch(() => props.active && props.active.status, st => { if (st === 'fail') showDialect.value = false })
+/** 只读区不是死路：一键切到可编辑的源脚本（执行仍按源脚本经转换器下发）。 */
+function goEditSource() {
+  if (!viewingDialect.value) return
+  showDialect.value = false
+  emit('toast', '已切到「源脚本」——这里可直接编辑；执行时会自动转换为目标库方言')
+}
 function onInput(e) { emit('input', e.target.value) }
 const ST = {
   idle: { txt: '待执行', cls: 'st-idle' },
@@ -99,6 +112,9 @@ const ST = {
                         title="查看/编辑 MySQL 风格源脚本（执行时按目标库类型自动转换）"
                         @click="showDialect = false">源脚本 · MySQL 风格</button>
               </span>
+              <button v-if="viewingDialect" type="button" class="pd-view pd-edit"
+                      title="方言视图为只读；点此切到可编辑的「源脚本」（执行时自动转换）"
+                      @click="goEditSource">✎ 去编辑</button>
               <span class="muted pd-meta">{{ active.meta }}</span>
             </div>
             <div class="pd-note" v-if="viewingDialect">
@@ -106,22 +122,27 @@ const ST = {
               <template v-else>
                 <span class="ok">✓ 已按 {{ active.dialectLabel }} 方言生成（{{ active.dialectText.split('\n').length }} 行，只读）</span>
                 <span v-if="active.dialectWarn.length" class="bad">· {{ active.dialectWarn.length }} 条语句被跳过：{{ active.dialectWarn[0] }}</span>
-                <span class="muted">· 要改脚本请切到「源脚本」</span>
+                <button type="button" class="pd-link" @click="goEditSource">要改脚本？点此切到可编辑的「源脚本」</button>
               </template>
+            </div>
+            <div class="pd-note pd-fail-hint" v-if="active.status === 'fail'">
+              <span class="bad">✗ 上次执行失败</span>
+              <span class="muted">可直接在下方编辑脚本后点「↻ 重试执行」（已自动切到可编辑的源脚本）。若失败原因是快照过期（表结构刚被改过），建议关掉本窗口 → 主面板点「▶ 拉取快照」重抓后重新生成。</span>
             </div>
             <textarea :value="shownText" class="patch-out" spellcheck="false"
                       :class="{ 'view-only': viewingDialect }" :readonly="viewingDialect" :disabled="busy"
+                      :title="viewingDialect ? '方言视图只读 —— 点这里即可切到可编辑的「源脚本」' : ''"
                       :placeholder="viewingDialect
                         ? '正在按目标库方言生成…'
                         : (active.roleName === '基准补丁'
                           ? '基准补丁：来自单表核对中勾选「补基准库 ADD」，目标为基准库（把比对库多出的字段反向补齐）。\n可手工修改后 复制 / 执行到 目标库。'
                           : '比对补丁：来自 差异总览 → ⊕ 自动补齐缺列 / ⊕ 缺表建表，或 单表核对 → 生成选中动作，目标为该比对库。\n生成只累积不打断，可继续核对/生成其它库，最后统一执行。')"
-                      @input="onInput"></textarea>
+                      @click="goEditSource" @input="onInput"></textarea>
             <div class="pd-actions">
-              <button type="button" class="btn danger-ghost" :disabled="emptyEditor || busy || viewingDialect"
-                      :title="viewingDialect ? '方言视图为只读，请切到「源脚本」后再清空' : '清空当前目标库补丁内容'"
+              <button type="button" class="btn danger-ghost" :disabled="!canOps || busy"
+                      :title="viewingDialect ? '清空该目标库补丁（源脚本与方言视图一并清空）' : '清空当前目标库补丁内容'"
                       @click="emit('clear')">清空补丁</button>
-              <button type="button" class="btn" :disabled="emptyEditor || busy"
+              <button type="button" class="btn" :disabled="!canOps || busy"
                       :title="viewingDialect ? '复制当前展示的目标方言语 SQL（可直接在该库执行）' : '复制 MySQL 风格源脚本'"
                       @click="emit('copy', viewingDialect ? 'dialect' : 'source')">
                 {{ viewingDialect ? '复制 ' + active.dialectLabel + ' 方言 SQL' : '复制源脚本（MySQL 风格）' }}
@@ -138,7 +159,7 @@ const ST = {
       </div>
 
       <footer class="pd-footer">
-        <span class="muted">执行成功即清空该库脚本并保留 ✓ 状态；失败保留内容可重试；「执行全部」按库串行执行。</span>
+        <span class="muted">执行成功即清空该库脚本并保留 ✓ 状态；失败会保留内容并自动切到可编辑的「源脚本」，改完可重试或清空；「执行全部」按库串行执行。</span>
         <button type="button" class="btn" :disabled="!pending.length || busy" :title="pending.length ? '按库串行执行全部待执行补丁（每库独立确认/转换）' : '没有待执行的补丁'"
                 @click="emit('run-all')">{{ busy ? '执行中…' : runAllLabel }}</button>
       </footer>
@@ -201,9 +222,17 @@ const ST = {
 }
 .pd-view:hover { color: var(--mint-700); }
 .pd-view.on { background: var(--mint-100); color: var(--mint-700); }
+/* 「✎ 去编辑」：只读方言视图下的显式编辑入口 */
+.pd-view.pd-edit { border: 1px solid var(--mint-300); border-radius: var(--r-pill); padding: 2px 10px; color: var(--mint-700); }
+.pd-view.pd-edit:hover { background: var(--mint-100); }
 .pd-note { font-size: 11px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .pd-note .ok { color: #3E8E5A; font-weight: 800; }
 .pd-note .bad { color: #C94F4F; font-weight: 800; }
+/* 提示行里的可点击跳转（切到可编辑视图） */
+.pd-link { border: 0; background: transparent; padding: 0; cursor: pointer; font-size: 11px; font-weight: 800; color: var(--mint-700); text-decoration: underline; }
+.pd-link:hover { color: var(--mint-600); }
+/* 执行失败引导条 */
+.pd-fail-hint { background: #FDF3F3; border: 1px solid #F3D6D6; border-radius: 8px; padding: 6px 10px; }
 
 .patch-out {
   width: 100%; box-sizing: border-box; min-height: 44vh; resize: vertical;
@@ -214,8 +243,8 @@ const ST = {
 }
 .patch-out:focus { border-color: var(--mint-300); }
 .patch-out:disabled { opacity: .75; cursor: not-allowed; }
-/* 方言视图：只读（改动只在源脚本侧做）—— 用浅底 + 默认光标提示不可编辑 */
-.patch-out.view-only { background: #F5FAF8; cursor: default; }
+/* 方言视图：只读，但**可点击**——点一下就切到可编辑的「源脚本」（浅底 + pointer 光标作提示） */
+.patch-out.view-only { background: #F5FAF8; cursor: pointer; }
 
 .pd-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .pd-warn { font-size: 11px; margin-left: auto; }
