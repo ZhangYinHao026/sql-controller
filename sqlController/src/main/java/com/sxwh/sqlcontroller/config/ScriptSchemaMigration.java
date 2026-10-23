@@ -26,6 +26,18 @@ public class ScriptSchemaMigration implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         migrateScriptNode();
         migrateHistory();
+        migrateOnlineConnection();
+    }
+
+    /**
+     * 线上区域表：db_type 是后加的（后续字段对比同步要用目标方言）。
+     * 早期版本建表时没有这一列，这里补齐，避免老库升级后启动即报 Unknown column。
+     */
+    private void migrateOnlineConnection() {
+        Set<String> columns = columns("online_connection");
+        if (columns.isEmpty()) return;
+        if (!columns.contains("db_type"))
+            jdbc.execute("ALTER TABLE online_connection ADD COLUMN db_type VARCHAR(20) NOT NULL DEFAULT 'mysql' COMMENT '该区域库类型：mysql/dm/oscar' AFTER region_name");
     }
 
     private void migrateScriptNode() {

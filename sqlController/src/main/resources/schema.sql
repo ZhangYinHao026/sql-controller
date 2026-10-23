@@ -53,3 +53,21 @@ CREATE TABLE IF NOT EXISTS script_node (
 
 INSERT IGNORE INTO script_node(id, node_type, name, parent_id, sql_text, sort_order, is_open)
 VALUES (1, 'folder', '默认分类', NULL, NULL, 0, 1);
+
+-- 线上环境：每个区域一条。查询统一经远程查询小助手（area 参数区分区域），
+-- 修改走该省 sxwh-allowance 的 updateSql（write_base_url，空=仅可查）。
+-- 与 database_connection 完全独立：无 host/port/账号，ID 空间独立（前端用 online:<id> 区分）。
+CREATE TABLE IF NOT EXISTS online_connection (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  area_code INT NOT NULL COMMENT '小助手区域码，如 32=江苏省',
+  region_name VARCHAR(100) NOT NULL COMMENT '区域名，如 江苏省',
+  db_type VARCHAR(20) NOT NULL DEFAULT 'mysql' COMMENT '该区域库类型：mysql/dm/oscar（字段对比同步时决定方言转换目标）',
+  display_name VARCHAR(100) COMMENT '展示名，空则用 region_name',
+  ver VARCHAR(10) NOT NULL DEFAULT 'BT21' COMMENT '小助手版本：BT18/BT21/BF',
+  write_base_url VARCHAR(500) COMMENT '该省 allowance 部署地址；空=仅可查不可写',
+  enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否启用',
+  remark VARCHAR(500) COMMENT '备注',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  UNIQUE KEY uk_online_ver_area (ver, area_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='线上环境配置表（每区域一条）';

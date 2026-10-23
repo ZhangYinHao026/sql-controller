@@ -51,6 +51,12 @@
             <artifactId>druid</artifactId>
             <version>1.2.20</version>
         </dependency>
+        <!-- SM4 加解密（线上写入通道用）：与 sxwh-allowance 的 Sm4 实现同算法（SM4/ECB/PKCS5Padding） -->
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk15on</artifactId>
+            <version>1.70</version>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

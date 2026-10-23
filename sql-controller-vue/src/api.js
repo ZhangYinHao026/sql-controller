@@ -116,5 +116,26 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({connectionIds: [connectionId], tables: tableNames}),
         timeoutMs: 60000
+    }),
+    /* ---------------- 线上环境（区域配置 / 小助手查询 / 各省 updateSql 写入） ---------------- */
+    onlineStatus: () => request('/api/online/status'),
+    onlineConnections: (keyword) => request(`/api/online/connections${keyword ? `?keyword=${encodeURIComponent(keyword)}` : ''}`),
+    onlineAdd: (body) => request('/api/online/connections', {method: 'POST', body: JSON.stringify(body)}),
+    onlineUpdate: (id, body) => request(`/api/online/connections/${id}`, {method: 'PUT', body: JSON.stringify(body)}),
+    onlineDelete: (id) => request(`/api/online/connections/${id}`, {method: 'DELETE'}),
+    onlineTest: (id) => request(`/api/online/connections/${id}/test`, {method: 'POST', timeoutMs: 150000}),
+    onlineTestDraft: (body) => request('/api/online/connections/test-draft', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 150000
+    }),
+    onlineRegions: (ver) => request(`/api/online/regions${ver ? `?ver=${encodeURIComponent(ver)}` : ''}`),
+    onlineImportRegions: (ver) => request(`/api/online/import-regions${ver ? `?ver=${encodeURIComponent(ver)}` : ''}`, {
+        method: 'POST', timeoutMs: 150000
+    }),
+    // 线上查询：后端按区域并行（每区域一次小助手请求），跨省网络慢 → 150s 上限
+    onlineQuery: (body) => request('/api/online/query', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 150000
+    }),
+    onlineWrite: (body) => request('/api/online/write', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 90000
     })
 }

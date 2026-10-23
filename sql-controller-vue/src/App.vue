@@ -5,15 +5,22 @@ import SqlEditor from './components/SqlEditor.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ConnectionSettings from './components/ConnectionSettings.vue'
 import ConnectionFormDialog from './components/ConnectionFormDialog.vue'
+import OnlineConnectionFormDialog from './components/OnlineConnectionFormDialog.vue'
 import HistoryDialog from './components/HistoryDialog.vue'
 import CommandSidebar from './components/CommandSidebar.vue'
 import { DB_REGISTRY, typeLabel } from './utils/dbRegistry'
 import { assembleStatements } from './utils/sqlStatements'
+import { onlineSqlInfo } from './utils/onlineSql'
 import ConvertDialog from './components/ConvertDialog.vue'
 import SchemaDiffDialog from './components/SchemaDiffDialog.vue'
 
 const sql = ref('')
 const dbTypes = ref([]), connections = ref([]), selectedType = ref('mysql'), selectedIds = ref([])
+/* 环境：local=本地 JDBC 直连；online=线上（查询经远程小助手只读，修改经各省 updateSql）。
+ * 两套连接 ID 空间独立，线上统一以 online:<id> 语义区分（接口层各走各的端点，不会混用）。 */
+const env = ref(localStorage.getItem('sql-controller-env') === 'online' ? 'online' : 'local')
+const onlineConnections = ref([]), onlineLoading = ref(false), onlineSelectedIds = ref([]), onlineStatus = ref(null)
+const onlineRegions = ref([]), onlineFormSaving = ref(false), editingOnline = ref(null), pendingOnlineDelete = ref(null)
 const results = ref([]), logs = ref([]), error = ref(''), activeTab = ref('result'), page = ref(1), pageSize = ref(10),
     pagination = ref(true), transactional = ref(false), loading = ref(false), notice = ref('')
 // 执行耗时与取消状态（取消=中止数据库端查询，非仅停前端等待）
@@ -29,14 +36,22 @@ const cardPages = reactive({})
 const cardSql = reactive({})
 const cardLoading = reactive({})
 const nodes = ref([]), nodesLoading = ref(false)
-const dialogs = reactive({settings: false, connectionForm: false, history: false, confirmDelete: false, convert: false, diff: false}), historyItems = ref([]), historyLoading = ref(false),
+const dialogs = reactive({settings: false, connectionForm: false, onlineForm: false, history: false, confirmDelete: false, confirmOnlineDelete: false, convert: false, diff: false}), historyItems = ref([]), historyLoading = ref(false),
     historyPage = ref(1), historyPageSize = ref(10), historyTotal = ref(0),
     settingsLoading = ref(false), settingsConnections = ref([]), editingConnection = ref(null),
     pendingDelete = ref(null)
-/* 类型 chips 名称/顺序：统一从 dbRegistry 派生（新增类型只改注册表） */
-const typeNames = Object.fromEntries(Object.entries(DB_REGISTRY).map(([k, m]) => [k, m.label]))
+/* 类型 chips 名称/顺序：统一从 dbRegistry 派生（新增类型只改注册表）。
+ * online 不是真实数据库类型（只用于结果卡展示），不进 DB_REGISTRY，避免出现在本地类型栏里 */
+const typeNames = {...Object.fromEntries(Object.entries(DB_REGISTRY).map(([k, m]) => [k, m.label])), online: '线上'}
+/* 本地类型 chips 用：剔除只用于线上结果展示的 online 伪类型 */
+const localTypeNames = computed(() => Object.fromEntries(Object.entries(typeNames).filter(([k]) => k !== 'online')))
 const currentConnections = computed(() => connections.value.filter(item => item.dbType === selectedType.value))
 const selectedConnections = computed(() => connections.value.filter(item => selectedIds.value.includes(item.id)))
+/* 线上区域（启用中的），与本地 currentConnections 平行 */
+const currentOnlineConnections = computed(() => onlineConnections.value.filter(item => item.enabled !== false))
+const selectedOnlineConnections = computed(() => currentOnlineConnections.value.filter(item => onlineSelectedIds.value.includes(item.id)))
+/* 编辑器内容的线上执行意图（只读 / 写入 / 不合法），用于路由提示 */
+const onlineRoute = computed(() => env.value === 'online' ? onlineSqlInfo(sql.value) : null)
 const metrics = computed(() => results.value.length ? `${results.value.filter(x => x.status === 'SUCCESS').length}/${results.value.length} 个数据库成功` : '尚未执行 SQL')
 const totalRows = computed(() => Math.max(0, ...results.value.map(item => Number(item.total || 0))))
 const totalPages = computed(() => pagination.value ? Math.max(1, Math.ceil(totalRows.value / Math.max(1, Number(pageSize.value) || 1))) : 1)
@@ -161,15 +176,132 @@ function toggleAllConnections() {
   selectedIds.value = ids.length && ids.every(id => selectedIds.value.includes(id)) ? [] : ids
 }
 
+/* ---------------- 线上环境：切换 / 加载 / 选择 ---------------- */
+
+/** 切换环境：两套结果不混用，切走时清空当前结果避免误读。 */
+function switchEnv(next) {
+  if (env.value === next) return
+  env.value = next
+  localStorage.setItem('sql-controller-env', next)
+  results.value = []
+  activeTab.value = 'result'
+  error.value = ''
+  if (next === 'online') loadOnline()
+}
+
+async function loadOnline(keyword) {
+  onlineLoading.value = true
+  try {
+    if (!onlineStatus.value) onlineStatus.value = await api.onlineStatus()
+    onlineConnections.value = await api.onlineConnections(keyword) || []
+    // 勾选收敛到仍存在的启用区域
+    const alive = new Set(currentOnlineConnections.value.map(c => c.id))
+    onlineSelectedIds.value = onlineSelectedIds.value.filter(id => alive.has(id))
+  } catch (e) {
+    toast(e.message)
+  } finally {
+    onlineLoading.value = false
+  }
+}
+
+function toggleOnline(id) {
+  onlineSelectedIds.value = onlineSelectedIds.value.includes(id)
+    ? onlineSelectedIds.value.filter(x => x !== id)
+    : [...onlineSelectedIds.value, id]
+}
+
+function toggleAllOnline() {
+  const ids = currentOnlineConnections.value.map(item => item.id)
+  onlineSelectedIds.value = ids.length && ids.every(id => onlineSelectedIds.value.includes(id)) ? [] : ids
+}
+
 function startExecute(selectedSql, script = null) {
   const value = (selectedSql || sql.value).trim();
   if (!value) return toast('请输入 SQL');
+  if (env.value === 'online') return startExecuteOnline(value);
   if (!selectedIds.value.length) return toast('至少选择一个数据库连接');
   const mode = selectedSql ? 'SELECTED' : 'ALL';
   const run = confirmed => execute(value, mode, confirmed, true, script);
   if (isRisky(value)) {
     Object.assign(confirm, {show: true, sql: value, targets: selectedConnections.value, warnings: [], action: () => run(true)})
   } else run(false)
+}
+
+/**
+ * 线上执行入口：按首词分两条通道。
+ * - 只读（SELECT/SHOW/DESC/EXPLAIN/WITH）→ 远程查询小助手，多区域并行；
+ * - 写入（UPDATE/INSERT/REPLACE）→ 各省 updateSql，强制单区域 + 二次确认。
+ * 末尾分号由后端自动去掉（此处不拦），多语句在此提前拦下并说明。
+ */
+function startExecuteOnline(value) {
+  if (!onlineSelectedIds.value.length) return toast('至少选择一个线上区域');
+  const info = onlineSqlInfo(value)
+  if (info.empty) return toast('请输入 SQL')
+  if (info.count > 1) return toast(info.error)
+  const writeIntent = info.write || info.delete || info.ddl
+  if (writeIntent) {
+    if (onlineSelectedIds.value.length > 1) return toast('线上修改只能选择 1 个区域')
+    if (!onlineStatus.value?.writeEnabled) return toast('服务端未配置 SM4 密钥，写入通道未启用')
+    const warn = info.ddl
+      ? 'DDL 会直接改动线上表结构，不可撤销，请确认 SQL 与目标区域无误'
+      : info.delete
+        ? 'DELETE 会直接删除线上生产数据，不可撤销，请确认 SQL 与目标区域无误'
+        : '线上生产数据，修改不可撤销，请确认 SQL 与目标区域无误'
+    Object.assign(confirm, {
+      show: true, sql: info.text, targets: selectedOnlineConnections.value,
+      warnings: [warn],
+      action: () => executeOnline(info.text, true, true)
+    })
+    return
+  }
+  executeOnline(info.text, false, false)
+}
+
+/** 线上执行（查询 / 写入共用结果结构，直接复用结果卡片渲染）。 */
+async function executeOnline(value, confirmed = false, isWrite = false, resetPage = true) {
+  loading.value = true;
+  error.value = '';
+  activeTab.value = 'result';
+  if (resetPage) page.value = 1;
+  lastExecution.sql = value;
+  lastExecution.mode = 'ONLINE';
+  lastExecution.confirmed = confirmed;
+  lastExecution.scriptNodeId = null;
+  lastExecution.params = {};
+  lastExecution.batch = false;      // 每区域各自请求，全局翻页无统一语义 → 用卡片内翻页
+  const rid = requestId();
+  currentRequestId = rid;
+  startTimer();
+  try {
+    const data = isWrite
+      ? await api.onlineWrite({connectionId: onlineSelectedIds.value[0], sql: value, confirmed})
+      : await api.onlineQuery({
+        connectionIds: onlineSelectedIds.value, sql: value, page: page.value,
+        pageSize: pagination.value ? Number(pageSize.value) : 100, requestId: rid
+      })
+    results.value = data.results || [];
+    results.value.forEach(item => { cardPages[item.connectionId] = 1; cardSql[item.connectionId] = value });
+    logs.value.unshift(...results.value.map(item => ({
+      ...item,
+      sql: value,
+      time: new Date().toLocaleString('zh-CN', {hour12: false})
+    })));
+    if (results.value.some(item => item.status === 'FAILED')) {
+      error.value = results.value.filter(item => item.status === 'FAILED').map(item => `${item.regionName}: ${item.errorMessage}`).join('\n');
+      activeTab.value = 'errors'
+    }
+    toast(`线上${isWrite ? '修改' : '查询'}完成：${data.successConnections || 0}/${data.totalConnections || 0} 个区域成功`)
+    return !results.value.some(item => item.status === 'FAILED')
+  } catch (e) {
+    error.value = e.message;
+    activeTab.value = 'errors';
+    toast(e.message);
+    return false
+  } finally {
+    stopTimer();
+    currentRequestId = null;
+    loading.value = false
+  }
 }
 
 // 转换→执行闭环：转换结果一键送回主链路（回填编辑器 + 切库型 + 预选该类型全部连接）
@@ -477,6 +609,10 @@ async function reloadResults() {
   // 批量执行（一键转换并执行）时各库方言不同、没有统一 SQL，全局翻页无意义 → 用每张卡片内的翻页
   if (lastExecution.batch) return;
   if (!lastExecution.sql || !isQuery(lastExecution.sql)) return;
+  if (env.value === 'online') {
+    await executeOnline(lastExecution.sql, false, false, false)
+    return
+  }
   page.value = Math.min(page.value, totalPages.value);
   await execute(lastExecution.sql, lastExecution.mode, lastExecution.confirmed, false, {
     scriptNodeId: lastExecution.scriptNodeId,
@@ -506,6 +642,8 @@ function sqlOfCard(item) {
 }
 
 function cardTotalPages(item) {
+  // 线上小助手只给 pagecount（总页数），没有总行数 → 直接用它，避免按行数反推失真
+  if (item && item.dbType === 'online' && item.pageCount) return Math.max(1, Number(item.pageCount))
   return pagination.value ? Math.max(1, Math.ceil(Number(item.total || 0) / Math.max(1, Number(pageSize.value) || 1))) : 1
 }
 
@@ -517,12 +655,18 @@ async function changeCardPage(item, delta) {
   if (cardLoading[item.connectionId] || target < 1 || target > cardTotalPages(item) || !sql || !isQuery(sql)) return
   cardLoading[item.connectionId] = true
   try {
-    const data = await api.execute({
-      connectionIds: [item.connectionId], sql, executionMode: lastExecution.mode,
-      ...(lastExecution.scriptNodeId ? {scriptNodeId: lastExecution.scriptNodeId, params: lastExecution.params} : {}),
-      page: target, pageSize: pagination.value ? Number(pageSize.value) : 100,
-      confirmed: lastExecution.confirmed, requestId: requestId()
-    })
+    // 线上：走小助手代理（每区域独立分页），不能复用本地 /api/sql/execute
+    const data = item.dbType === 'online'
+      ? await api.onlineQuery({
+        connectionIds: [item.connectionId], sql, page: target,
+        pageSize: pagination.value ? Number(pageSize.value) : 100
+      })
+      : await api.execute({
+        connectionIds: [item.connectionId], sql, executionMode: lastExecution.mode,
+        ...(lastExecution.scriptNodeId ? {scriptNodeId: lastExecution.scriptNodeId, params: lastExecution.params} : {}),
+        page: target, pageSize: pagination.value ? Number(pageSize.value) : 100,
+        confirmed: lastExecution.confirmed, requestId: requestId()
+      })
     const replacement = data.results?.[0]
     if (replacement) {
       const index = results.value.findIndex(row => row.connectionId === item.connectionId)
@@ -545,6 +689,100 @@ async function openSettings() {
     toast(e.message)
   } finally {
     settingsLoading.value = false
+  }
+  // 线上区域与状态一起拉（设置页切 Tab 即可看到，不再等用户点）
+  loadOnline()
+}
+
+/* ---------------- 线上区域配置维护 ---------------- */
+
+function addOnlineConnection() {
+  editingOnline.value = null
+  dialogs.onlineForm = true
+}
+
+function editOnlineConnection(row) {
+  editingOnline.value = row
+  dialogs.onlineForm = true
+}
+
+async function loadOnlineRegions(ver) {
+  try {
+    const data = await api.onlineRegions(ver)
+    onlineRegions.value = data?.regions || []
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
+async function saveOnlineConnection(payload) {
+  onlineFormSaving.value = true
+  try {
+    if (payload.id) await api.onlineUpdate(payload.id, payload)
+    else await api.onlineAdd(payload)
+    await loadOnline()
+    dialogs.onlineForm = false
+    toast('线上区域已保存')
+  } catch (e) {
+    toast(e.message)
+  } finally {
+    onlineFormSaving.value = false
+  }
+}
+
+async function testOnlineForm(payload) {
+  onlineFormSaving.value = true
+  try {
+    const r = await api.onlineTestDraft(payload)
+    toast(r?.success
+      ? `连通正常：${r.durationMs}ms，数据时间 ${r.dataTime || '—'}`
+      : `连通失败：${r?.errorMessage || '未知错误'}`)
+  } catch (e) {
+    toast(e.message)
+  } finally {
+    onlineFormSaving.value = false
+  }
+}
+
+async function testOnline(row) {
+  toast(`正在测试区域 ${row.areaCode}…`)
+  try {
+    const r = await api.onlineTest(row.id)
+    toast(r?.success
+      ? `区域 ${row.areaCode} 连通正常：${r.durationMs}ms`
+      : `区域 ${row.areaCode} 连通失败：${r?.errorMessage || '未知错误'}`)
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
+async function importOnlineRegions() {
+  try {
+    const r = await api.onlineImportRegions('BT21')
+    await loadOnline()
+    toast(`导入完成：新增 ${r.imported} 个，已存在 ${r.skipped} 个${r.error ? `（清单拉取告警：${r.error}）` : ''}`)
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
+function removeOnline(row) {
+  pendingOnlineDelete.value = row
+  dialogs.confirmOnlineDelete = true
+}
+
+async function confirmDeleteOnline() {
+  const row = pendingOnlineDelete.value
+  if (!row) return
+  dialogs.confirmOnlineDelete = false
+  pendingOnlineDelete.value = null
+  try {
+    await api.onlineDelete(row.id)
+    onlineSelectedIds.value = onlineSelectedIds.value.filter(id => id !== row.id)
+    await loadOnline()
+    toast('线上区域已删除')
+  } catch (e) {
+    toast(e.message)
   }
 }
 
@@ -642,6 +880,8 @@ function changeHistoryPageSize(size) {
 
 onMounted(async () => {
   await Promise.all([loadTypes(), loadConnections(), loadNodes()])
+  // 上次停在线上环境 → 直接恢复线上区域列表，避免切换后空白
+  if (env.value === 'online') loadOnline()
 })
 </script>
 
@@ -662,16 +902,25 @@ onMounted(async () => {
     <CommandSidebar :nodes="nodes" :loading="nodesLoading" @reload="loadNodes" @create="createNode" @update="updateNode" @remove="removeNode" @send="sendCommand" @error="toast" @convert="dialogs.convert = true" />
     <div class="container workspace-content">
     <section class="card selector">
-      <div class="selector-row"><span class="label">数据库类型</span>
+      <div class="selector-row"><span class="label">环境</span>
+        <div class="env-switch">
+          <button type="button" class="env-btn" :class="{ on: env === 'local' }" @click="switchEnv('local')">本地</button>
+          <button type="button" class="env-btn" :class="{ on: env === 'online', online: env === 'online' }"
+                  @click="switchEnv('online')">线上 · 生产</button>
+        </div>
+        <span v-if="env === 'online'" class="env-note">只读查询经远程小助手 · 修改走写入接口（updateSql）</span>
+        <span v-else class="note">本地 JDBC 直连（MySQL / 达梦 / 神通）</span>
+      </div>
+      <div v-if="env === 'local'" class="selector-row"><span class="label">数据库类型</span>
         <div class="choices">
-          <button v-for="(name, type) in typeNames" :key="type" class="choice"
+          <button v-for="(name, type) in localTypeNames" :key="type" class="choice"
                   :class="{ active: selectedType === type }" @click="selectType(type)">{{ name }} <small
               v-if="dbTypes.find(item => item.dbType === type)">({{
               dbTypes.find(item => item.dbType === type).total
             }})</small></button>
         </div>
       </div>
-      <div class="selector-row"><span class="label">省份 / 环境</span>
+      <div v-if="env === 'local'" class="selector-row"><span class="label">省份 / 环境</span>
         <div class="choices">
           <button v-if="currentConnections.length >= 2" class="choice select-all" :class="{ active: currentConnections.every(item => selectedIds.includes(item.id)) }" @click="toggleAllConnections">{{ currentConnections.every(item => selectedIds.includes(item.id)) ? '取消全选' : '全选' }}</button>
           <button v-for="item in currentConnections" :key="item.id" class="choice"
@@ -680,8 +929,30 @@ onMounted(async () => {
           </button>
           <span v-if="!currentConnections.length" class="muted">暂无该类型连接，请在设置中新增</span></div>
         <span class="note">可多选，同一 SQL 将在每个选中数据库中执行</span></div>
+      <div v-else class="selector-row"><span class="label">区域</span>
+        <div class="choices">
+          <button v-if="currentOnlineConnections.length >= 2" class="choice select-all"
+                  :class="{ active: currentOnlineConnections.every(item => onlineSelectedIds.includes(item.id)) }"
+                  @click="toggleAllOnline">{{ currentOnlineConnections.every(item => onlineSelectedIds.includes(item.id)) ? '取消全选' : '全选' }}</button>
+          <button v-for="item in currentOnlineConnections" :key="item.id" class="choice"
+                  :class="{ active: onlineSelectedIds.includes(item.id) }" @click="toggleOnline(item.id)">
+            {{ item.displayName || item.regionName }} <small>{{ item.areaCode }}</small>
+          </button>
+          <span v-if="!currentOnlineConnections.length" class="muted">
+            暂无线上区域，请到「设置 → 线上环境」点「⟳ 导入 java 区域」</span>
+        </div>
+        <span class="note">可多选（每区域各发一次请求并行执行）· 只读查询 · 末尾分号自动去除</span></div>
     </section>
     <SqlEditor v-model="sql" v-model:transactional="transactional" @execute="startExecute"/>
+    <div v-if="env === 'online' && onlineRoute" class="route-hint">
+      <span class="pill" :class="onlineRoute.error ? 'bad' : (onlineRoute.readOnly ? 'read' : 'write')">
+        {{ onlineRoute.error ? '无法执行' : (onlineRoute.readOnly ? '远程查询小助手 · 只读' : '写入接口 · 需确认') }}
+      </span>
+      <span v-if="onlineRoute.error">{{ onlineRoute.error }}</span>
+      <span v-else-if="onlineRoute.hasTrailingSemicolon">检测到末尾分号，执行时会自动去掉</span>
+      <span v-else-if="!onlineRoute.readOnly">修改语句：只能选 1 个区域，执行前会二次确认</span>
+      <span v-else>将按选中区域并行查询，每个区域一张结果卡</span>
+    </div>
     <section class="card result">
       <div class="result-head">
         <div class="tabs">
@@ -708,15 +979,23 @@ onMounted(async () => {
         <div v-else-if="!results.length" class="empty">执行 SELECT 查询后将在此显示各数据库结果</div>
         <div v-else class="result-grid">
           <article v-for="item in results" :key="item.connectionId" class="result-card">
-            <div class="result-card-head"><b>{{ typeNames[item.dbType] }} · {{
+            <div class="result-card-head"><b>{{ typeNames[item.dbType] || item.dbType }} · {{
                 item.regionName
               }}</b><span>{{
                 item.status === 'SUCCESS' ? `${item.total || item.affectedRows || 0} 条记录 · ${item.durationMs} ms` : (item.status === 'CANCELLED' ? '已取消' : '执行失败')
               }}</span></div>
+            <div v-if="item.dbType === 'online' && item.status === 'SUCCESS'" class="card-meta">
+              <span class="chip">线上 · 区域 {{ item.areaCode }}</span>
+              <span v-if="item.dbDialect" class="chip plain">{{ typeNames[item.dbDialect] || item.dbDialect }}</span>
+              <span v-if="item.dataTime" class="chip plain">数据时间 {{ item.dataTime }}</span>
+              <span v-if="item.dataId" class="chip plain">dataId {{ String(item.dataId).slice(0, 12) }}</span>
+              <span class="chip plain">{{ item.source }}</span>
+            </div>
             <div v-if="item.status === 'CANCELLED'" class="error-inline cancel-inline">{{ item.errorMessage || '查询已取消' }}</div>
             <div v-else-if="item.status === 'FAILED'" class="error-inline">{{ item.errorMessage }}</div>
-            <div v-else-if="!item.columns?.length" class="empty small-empty">执行成功，影响 {{ item.affectedRows || 0 }}
-              行
+            <div v-else-if="!item.columns?.length" class="empty small-empty">
+              <template v-if="item.message">{{ item.message }}</template>
+              <template v-else>执行成功，影响 {{ item.affectedRows || 0 }} 行</template>
             </div>
             <div v-else class="table-wrap">
               <table class="data-table" :class="{ 'table-loading': cardLoading[item.connectionId] }">
@@ -759,12 +1038,26 @@ onMounted(async () => {
                  :message="pendingDelete ? `确定删除 “${pendingDelete.regionName}” 连接吗？此操作不可恢复。` : ''"
                  confirm-text="删除" :show="dialogs.confirmDelete"
                  @confirm="confirmDeleteConnection" @cancel="dialogs.confirmDelete = false; pendingDelete = null"/>
+  <ConfirmDialog mode="generic" title="删除线上区域"
+                 :message="pendingOnlineDelete ? `确定删除线上区域 “${pendingOnlineDelete.regionName}（${pendingOnlineDelete.areaCode}）” 吗？只影响本工具的配置，不会改动线上数据。` : ''"
+                 confirm-text="删除" :show="dialogs.confirmOnlineDelete"
+                 @confirm="confirmDeleteOnline"
+                 @cancel="dialogs.confirmOnlineDelete = false; pendingOnlineDelete = null"/>
   <ConnectionSettings :show="dialogs.settings" :connections="settingsConnections" :loading="settingsLoading"
+                      :online-connections="onlineConnections" :online-loading="onlineLoading" :online-status="onlineStatus"
                       @close="dialogs.settings = false" @add="addConnection" @edit="editConnection" @remove="removeConnection"
                       @test="testConnection"
+                      @online-add="addOnlineConnection" @online-edit="editOnlineConnection" @online-remove="removeOnline"
+                      @online-test="testOnline" @online-import="importOnlineRegions"
+                      @online-search="keyword => loadOnline(keyword)"
+                      @tab="tab => { if (tab === 'online') loadOnline() }"
                       @search="async keyword => { settingsConnections = await api.connections(null, keyword) }"/>
   <ConnectionFormDialog :show="dialogs.connectionForm" :connection="editingConnection"
                         @close="dialogs.connectionForm = false" @save="saveConnection" @test="testFormConnection"/>
+  <OnlineConnectionFormDialog :show="dialogs.onlineForm" :connection="editingOnline" :regions="onlineRegions"
+                              :saving="onlineFormSaving"
+                              @close="dialogs.onlineForm = false" @save="saveOnlineConnection" @test="testOnlineForm"
+                              @load-regions="loadOnlineRegions" @toast="toast"/>
   <HistoryDialog :show="dialogs.history" :items="historyItems" :loading="historyLoading"
                  :page="historyPage" :total-pages="historyTotalPages" :has-next="historyHasNext"
                  :page-size="historyPageSize" :total="historyTotal"
