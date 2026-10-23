@@ -38,10 +38,17 @@ sql-controller:
     default-page-size: 10
     max-page-size: 500
     write:
-      # SM4 密钥只走后端环境变量，绝不入库/入库文件；为空表示写入通道未启用（只查不改）
+      # 加密串生成方式：remote=先调中心加密接口再写（默认，推荐）；local=本地 sm4-key 自己算；auto=远程失败回落本地
+      encrypt-mode: ${SQL_ONLINE_ENCRYPT_MODE:remote}
+      # 中心加密接口：POST 明文（JSON 字符串字面量，含权限后缀）→ 返回 hex 加密串
+      # 注意：text/plain 会 415，必须 application/json
+      encrypt-url: ${SQL_ONLINE_ENCRYPT_URL:http://111.56.142.13:18080/api/sxwh/updateSqlSm}
+      encrypt-timeout-seconds: 30
+      # SM4 密钥只在 local / auto 回落时用到；remote 模式可留空
       sm4-key: ${SQL_ONLINE_SM4_KEY:}
       permission-suffix: ${SQL_ONLINE_PERMISSION_SUFFIX:sxwhkj@2024}
-      path: /api/apply/updateSql
+      # 写入路径：/api/sxwh/updateSql 无需登录态（实测可用）；/api/apply/updateSql 需要登录 token
+      path: ${SQL_ONLINE_WRITE_PATH:/api/sxwh/updateSql}
       timeout-seconds: 60
       allow-delete: true              # 内部开发工具：DELETE/DROP 等由前端二次确认把关
       # 说明：DDL（CREATE/ALTER/DROP/TRUNCATE/RENAME）始终允许——字段对比「本地结构同步到线上」要用

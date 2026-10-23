@@ -10,6 +10,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.*;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.client.RestTemplate;
 
 import java.nio.charset.StandardCharsets;
@@ -17,13 +19,13 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 线上写入：调用各省 sxwh-allowance 部署的 {@code /api/apply/updateSql}。
+ * 线上写入：生成加密串 → 调目标省份的 {@code /api/apply/updateSql}。
  *
- * <p>协议（2026-10-23 核对源码）：请求体是 <b>裸字符串</b>（SM4/ECB/PKCS5 密文的 hex）；
- * 明文 SQL 末尾必须带权限后缀 {@code sxwhkj@2024}，服务端 strip 后才执行。
- * 响应 {@code {code:200, msg:"更新成功N条数据"}} / {@code {code:500, msg:"更新失败原因：…"}}。</p>
+ * <p>加密串默认由<b>中心加密接口</b>生成（{@code POST /api/sxwh/updateSqlSm}，2026-10-23 核对）：
+ * 请求体是 JSON 字符串字面量（明文 SQL + 权限后缀 {@code sxwhkj@2024}），响应体也是 JSON 字符串字面量（hex 密文）。
+ * 拿到加密串后原样作为请求体 POST 给对应省份的 updateSql；服务端 strip 掉权限后缀后才执行。</p>
  *
- * <p>写地址按区域单独配置（每省各一套部署）；未配置 writeBaseUrl 的区域只能查不能写。</p>
+ * <p>各区域写地址单独配置（每省一套部署）；未配置 writeBaseUrl 的区域只能查不能写。</p>
  */
 @Service
 public class OnlineWriteService {
@@ -32,6 +34,8 @@ public class OnlineWriteService {
     private final OnlineProperties properties;
     private final ObjectMapper mapper = new ObjectMapper();
     private final RestTemplate http;
+    /** 专用于中心加密接口（超时更短，避免写通道被加密服务拖死）。 */
+    private final RestTemplate cryptoHttp;
 
     public OnlineWriteService(OnlineProperties properties) {
         this.properties = properties;
@@ -39,47 +43,52 @@ public class OnlineWriteService {
         f.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
         f.setReadTimeout(Math.max(1, properties.getWrite().getTimeoutSeconds()) * 1000);
         this.http = new RestTemplate(f);
+
+        SimpleClientHttpRequestFactory cf = new SimpleClientHttpRequestFactory();
+        cf.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
+        cf.setReadTimeout(Math.max(1, properties.getWrite().getEncryptTimeoutSeconds()) * 1000);
+        this.cryptoHttp = new RestTemplate(cf);
     }
 
     /** 执行一条写语句；调用方必须已完成二次确认。 */
     public Map<String, Object> write(OnlineConnection c, String rawSql) {
         long started = System.currentTimeMillis();
         Map<String, Object> item = new LinkedHashMap<>();
+        String mode = properties.getWrite().normalizedEncryptMode();
         item.put("connectionId", c.getId());
         item.put("scope", "online");
         item.put("dbType", "online");
         item.put("areaCode", c.getAreaCode());
         item.put("regionName", c.label());
         item.put("dbDialect", c.getDbType());
-        item.put("source", "写入接口（updateSql）");
+        item.put("encryptMode", mode);
+        item.put("source", "local".equals(mode) ? "写入接口（updateSql · 本地加密）" : "写入接口（updateSql · 中心加密）");
         try {
-            if (!properties.writeEnabled()) throw new IllegalStateException("服务端未配置 SM4 密钥，写入通道未启用");
+            if (!properties.writeEnabled()) throw new IllegalStateException("服务端未配置加密方式（中心加密接口地址或 SM4 密钥缺失），写入通道未启用");
             String base = trimUrl(c.getWriteBaseUrl());
             if (base.isEmpty()) throw new IllegalStateException("该区域未配置写入地址（仅支持查询）");
             String sql = OnlineSqlGuard.prepareWrite(rawSql, properties.getWrite().isAllowDelete());
-            String plain = sql + "\n" + properties.getWrite().getPermissionSuffix();
-            String hex = Sm4Util.encryptHex(properties.getWrite().getSm4Key(), plain);
+            String plain = plainFor(sql, properties.getWrite().getPermissionSuffix());
+            String hex = encrypt(plain);
 
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.parseMediaType("text/plain; charset=UTF-8"));
-            HttpEntity<String> entity = new HttpEntity<>(hex, headers);
             String url = base + properties.getWrite().getPath();
-            ResponseEntity<byte[]> resp = http.exchange(url, HttpMethod.POST, entity, byte[].class);
-            String text = resp.getBody() == null ? "" : new String(resp.getBody(), StandardCharsets.UTF_8);
-            if (!text.isEmpty() && text.charAt(0) == '\uFEFF') text = text.substring(1);
+            ResponseEntity<byte[]> resp = postJsonString(http, url, hex, "写入接口");
+            String text = bodyText(resp);
 
             String msg;
-            int code;
+            int code = 500;
             try {
                 Map<?, ?> body = mapper.readValue(text, LinkedHashMap.class);
                 code = toInt(body.get("code"), resp.getStatusCodeValue() == 200 ? 200 : 500);
                 msg = str(body.get("msg"), str(body.get("message"), truncate(text)));
             } catch (Exception e) {
-                throw new IllegalStateException("写入接口返回非 JSON（HTTP " + resp.getStatusCodeValue() + "）：" + truncate(text));
+                throw new IllegalStateException("写入接口返回非 JSON（HTTP " + resp.getStatusCodeValue() + "）：" + truncate(text)
+                        + "；若为 415，请检查 sql-controller.online.write.path（应指向该省 /api/sxwh/updateSql）");
             }
             if (code != 200) {
                 item.put("status", "FAILED");
                 item.put("errorMessage", msg == null || msg.isEmpty() ? "写入失败（code=" + code + "）" : msg);
+                if (code == 401) item.put("errorMessage", msg + "（该路径需要登录态，请改用 /api/sxwh/updateSql）");
             } else {
                 item.put("status", "SUCCESS");
                 item.put("message", msg);
@@ -95,6 +104,102 @@ public class OnlineWriteService {
         }
         item.put("durationMs", System.currentTimeMillis() - started);
         return item;
+    }
+
+    /** 明文 = SQL + 换行 + 权限后缀（服务端**按后缀判定权限**，命中后 strip 再执行）。 */
+    static String plainFor(String sql, String suffix) {
+        String s = sql == null ? "" : sql.trim();
+        String suf = suffix == null ? "" : suffix.trim();
+        return suf.isEmpty() ? s : s + "\n" + suf;
+    }
+
+    /** 生成加密串：remote=中心加密接口（默认），local=本地 SM4，auto=远程失败回落本地。 */
+    String encrypt(String plain) {
+        String mode = properties.getWrite().normalizedEncryptMode();
+        if ("local".equals(mode)) {
+            if (!properties.getWrite().hasLocalKey()) throw new IllegalStateException("加密方式为 local，但未配置 sm4-key");
+            return Sm4Util.encryptHex(properties.getWrite().getSm4Key(), plain);
+        }
+        try {
+            return encryptRemote(plain);
+        } catch (RuntimeException e) {
+            if ("auto".equals(mode) && properties.getWrite().hasLocalKey()) {
+                log.warn("[online-write] 中心加密接口不可用，回落本地 SM4：{}", e.getMessage());
+                return Sm4Util.encryptHex(properties.getWrite().getSm4Key(), plain);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * 调中心加密接口：{@code POST /api/sxwh/updateSqlSm}。
+     *
+     * <p>请求体必须是 <b>JSON 字符串字面量</b>（例如 {@code "UPDATE t SET a=1\nsxwhkj@2024"}，
+     * Content-Type: application/json，text/plain 会 415）；响应体同样是 JSON 字符串字面量（hex 密文）。</p>
+     */
+    private String encryptRemote(String plain) {
+        String url = properties.getWrite().getEncryptUrl() == null ? "" : properties.getWrite().getEncryptUrl().trim();
+        if (url.isEmpty()) throw new IllegalStateException("未配置中心加密接口地址（sql-controller.online.write.encrypt-url）");
+        ResponseEntity<byte[]> resp = postJsonString(cryptoHttp, url, plain, "加密接口");
+        return parseEncryptResponse(bodyText(resp), mapper);
+    }
+
+    /** 解析加密接口响应：支持 JSON 字符串字面量（正常）与错误 JSON 对象（{code,msg}）。 */
+    static String parseEncryptResponse(String text, ObjectMapper mapper) {
+        String t = text == null ? "" : text.trim();
+        if (!t.isEmpty() && t.charAt(0) == '\uFEFF') t = t.substring(1).trim();
+        if (t.isEmpty()) throw new IllegalStateException("加密接口返回空响应");
+        if (t.startsWith("{")) {
+            String msg = t;
+            try {
+                Map<?, ?> body = mapper.readValue(t, LinkedHashMap.class);
+                Object m = body.get("msg");
+                if (m == null) m = body.get("message");
+                if (m != null) msg = String.valueOf(m);
+            } catch (Exception ignore) {
+                // 解析不了就原样截断返回
+            }
+            throw new IllegalStateException("加密接口返回错误：" + truncate(msg));
+        }
+        String hex = t;
+        if (hex.startsWith("\"")) {
+            try {
+                hex = mapper.readValue(hex, String.class);
+            } catch (Exception e) {
+                throw new IllegalStateException("加密接口返回无法解析的字符串：" + truncate(t));
+            }
+        }
+        hex = hex == null ? "" : hex.trim();
+        if (!hex.matches("[0-9a-fA-F]{32,}") || (hex.length() & 1) == 1) {
+            throw new IllegalStateException("加密接口返回的不是合法加密串：" + truncate(t));
+        }
+        return hex.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** 以 JSON 字符串字面量 POST（两个后端接口用 @RequestBody String 接收，text/plain 会 415）。 */
+    private ResponseEntity<byte[]> postJsonString(RestTemplate client, String url, String raw, String what) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String body;
+        try {
+            body = mapper.writeValueAsString(raw);
+        } catch (Exception e) {
+            throw new IllegalStateException(what + "请求体序列化失败：" + e.getMessage(), e);
+        }
+        try {
+            return client.exchange(url, HttpMethod.POST, new HttpEntity<>(body, headers), byte[].class);
+        } catch (RestClientResponseException e) {
+            String detail = e.getRawStatusCode() == 415 ? "（Content-Type 不被接受）" : "";
+            throw new IllegalStateException(what + "返回 HTTP " + e.getRawStatusCode() + detail + "：" + truncate(e.getResponseBodyAsString()));
+        } catch (RestClientException e) {
+            throw new IllegalStateException("调用" + what + "失败（" + url + "）：" + e.getMessage(), e);
+        }
+    }
+
+    private static String bodyText(ResponseEntity<byte[]> resp) {
+        String text = resp.getBody() == null ? "" : new String(resp.getBody(), StandardCharsets.UTF_8);
+        if (!text.isEmpty() && text.charAt(0) == '\uFEFF') text = text.substring(1);
+        return text;
     }
 
     /** 从「更新成功 3 条数据」里抠出影响行数，抠不到给 0。 */

@@ -241,7 +241,7 @@ function startExecuteOnline(value) {
   const writeIntent = info.write || info.delete || info.ddl
   if (writeIntent) {
     if (onlineSelectedIds.value.length > 1) return toast('线上修改只能选择 1 个区域')
-    if (!onlineStatus.value?.writeEnabled) return toast('服务端未配置 SM4 密钥，写入通道未启用')
+    if (!onlineStatus.value?.writeEnabled) return toast('服务端未配置加密方式（中心加密接口地址/密钥），写入通道未启用')
     const warn = info.ddl
       ? 'DDL 会直接改动线上表结构，不可撤销，请确认 SQL 与目标区域无误'
       : info.delete

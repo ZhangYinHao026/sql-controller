@@ -118,7 +118,7 @@ function onTest() {
       </label>
       <label class="check-line span-2"><input v-model="form.enabled" type="checkbox" /> 启用该区域（查询页可选）</label>
     </div>
-    <p class="form-tip">查询统一经远程查询小助手（只读，末尾分号会自动去掉，多语句需拆分）；写入走该省 updateSql（SM4 加密，需二次确认）。</p>
+    <p class="form-tip">查询统一经远程查询小助手（只读，末尾分号会自动去掉，多语句需拆分）；写入时先调中心加密接口生成加密串，再提交到该省 updateSql（需二次确认）。</p>
     <footer class="modal-actions">
       <button class="btn test-left" :disabled="saving" @click="onTest">测试连通</button>
       <button class="btn" @click="$emit('close')">取消</button>

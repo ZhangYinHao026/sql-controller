@@ -29,7 +29,20 @@ public class OnlineProperties {
     private Write write = new Write();
 
     public static class Write {
-        /** SM4 ECB 密钥（hex，32 字符）。为空表示未启用写入通道。 */
+        /**
+         * 加密串生成方式：
+         * <ul>
+         *   <li>{@code remote}（默认）：POST 明文到中心加密接口 {@link #encryptUrl}，用返回的加密串写各省；</li>
+         *   <li>{@code local}：用本地 {@link #sm4Key} 自己算（离线/排障用）；</li>
+         *   <li>{@code auto}：先远程，失败再回落本地（需配 sm4Key）。</li>
+         * </ul>
+         */
+        private String encryptMode = "remote";
+        /** 中心加密接口（入参明文 JSON 字符串，出参 hex 加密串）。 */
+        private String encryptUrl = "http://111.56.142.13:18080/api/sxwh/updateSqlSm";
+        /** 调中心加密接口的超时秒数。 */
+        private int encryptTimeoutSeconds = 30;
+        /** SM4 ECB 密钥（hex，32 字符）：仅 local / auto 回落时使用，remote 模式可为空。 */
         private String sm4Key = "";
         /** 权限后缀，明文 SQL 末尾必须带，服务端 strip 后才执行。 */
         private String permissionSuffix = "sxwhkj@2024";
@@ -37,11 +50,28 @@ public class OnlineProperties {
         private int timeoutSeconds = 60;
         /** 是否允许 DELETE（内部开发工具，默认开；如线上要收紧可置 false）。 */
         private boolean allowDelete = true;
-        /** 写入接口路径，默认 sxwh-allowance 的 /api/apply/updateSql。 */
-        private String path = "/api/apply/updateSql";
+        /** 写入接口路径。默认 {@code /api/sxwh/updateSql}（实测可用；{@code /api/apply/updateSql} 需登录态）。 */
+        private String path = "/api/sxwh/updateSql";
 
+        public String getEncryptMode() { return encryptMode; }
+        public void setEncryptMode(String encryptMode) { this.encryptMode = encryptMode; }
+        public String getEncryptUrl() { return encryptUrl; }
+        public void setEncryptUrl(String encryptUrl) { this.encryptUrl = encryptUrl; }
+        public int getEncryptTimeoutSeconds() { return encryptTimeoutSeconds; }
+        public void setEncryptTimeoutSeconds(int encryptTimeoutSeconds) { this.encryptTimeoutSeconds = encryptTimeoutSeconds; }
         public String getSm4Key() { return sm4Key; }
         public void setSm4Key(String sm4Key) { this.sm4Key = sm4Key; }
+
+        /** 规范化后的加密方式（未知值一律按 remote 处理）。 */
+        public String normalizedEncryptMode() {
+            String m = encryptMode == null ? "" : encryptMode.trim().toLowerCase(java.util.Locale.ROOT);
+            if ("local".equals(m) || "auto".equals(m)) return m;
+            return "remote";
+        }
+        /** 是否配置了中心加密接口。 */
+        public boolean hasEncryptUrl() { return encryptUrl != null && !encryptUrl.trim().isEmpty(); }
+        /** 是否配置了本地 SM4 密钥（local 模式必须，auto 模式用于回落）。 */
+        public boolean hasLocalKey() { return sm4Key != null && !sm4Key.trim().isEmpty(); }
         public String getPermissionSuffix() { return permissionSuffix; }
         public void setPermissionSuffix(String permissionSuffix) { this.permissionSuffix = permissionSuffix; }
         public int getTimeoutSeconds() { return timeoutSeconds; }
@@ -76,9 +106,13 @@ public class OnlineProperties {
         return v;
     }
 
-    /** 是否已配置写入通道（有密钥即视为启用）。 */
+    /** 是否已配置写入通道（remote 看加密接口地址，local 看密钥）。 */
     public boolean writeEnabled() {
-        return write != null && write.getSm4Key() != null && !write.getSm4Key().trim().isEmpty();
+        if (write == null) return false;
+        String mode = write.normalizedEncryptMode();
+        if ("local".equals(mode)) return write.hasLocalKey();
+        if ("auto".equals(mode)) return write.hasEncryptUrl() || write.hasLocalKey();
+        return write.hasEncryptUrl();
     }
 
     /** 页大小边界保护。 */

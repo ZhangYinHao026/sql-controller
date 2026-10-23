@@ -108,6 +108,9 @@ public class OnlineConnectionService {
         out.put("queryPath", "/LocalTest/ToSel");
         out.put("writeEnabled", properties.writeEnabled());
         out.put("writePath", properties.getWrite().getPath());
+        out.put("encryptMode", properties.getWrite().normalizedEncryptMode());
+        out.put("encryptUrl", properties.getWrite().getEncryptUrl());
+        out.put("localKeyConfigured", properties.getWrite().hasLocalKey());
         out.put("allowDelete", properties.getWrite().isAllowDelete());
         out.put("defaultPageSize", properties.getDefaultPageSize());
         return out;
