@@ -11,6 +11,8 @@ import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.HttpStatusCodeException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
@@ -158,12 +160,7 @@ public class OnlineQueryService {
         headers.set(HttpHeaders.REFERER, properties.baseUrl() + "/");
         HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(form, headers);
 
-        ResponseEntity<byte[]> resp;
-        try {
-            resp = http.exchange(properties.baseUrl() + "/LocalTest/ToSel", HttpMethod.POST, entity, byte[].class);
-        } catch (Exception e) {
-            throw new IllegalStateException("调用小助手失败：" + message(e));
-        }
+        ResponseEntity<byte[]> resp = postWithRetry(entity);
         byte[] body = resp.getBody();
         String text = body == null ? "" : new String(body, StandardCharsets.UTF_8);
         if (!text.isEmpty() && text.charAt(0) == '\uFEFF') text = text.substring(1);
@@ -206,6 +203,85 @@ public class OnlineQueryService {
             return new Rows(columns, rows, Math.max(1, pageCount), dataTime, dataId);
         }
         throw new IllegalStateException("小助手返回结构异常：缺少 data 字段");
+    }
+
+    /**
+     * 发请求，5xx/网络 IO 自动重试一次（读操作幂等）。
+     * 小助手侧偶发 500（其内部非线程安全集合并发写入抛「已添加了具有相同键的项」），重试即可绕过。
+     */
+    private ResponseEntity<byte[]> postWithRetry(HttpEntity<MultiValueMap<String, String>> entity) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return http.exchange(properties.baseUrl() + "/LocalTest/ToSel", HttpMethod.POST, entity, byte[].class);
+            } catch (HttpStatusCodeException e) {
+                int sc = e.getRawStatusCode();
+                if (attempt == 1 && sc >= 500) {
+                    log.warn("[online] 小助手 HTTP {}（第 1 次），500ms 后重试", sc);
+                    sleepQuietly(500);
+                    continue;
+                }
+                throw new IllegalStateException("小助手 HTTP " + sc + "：" + friendlyHttpBody(e.getResponseBodyAsByteArray()));
+            } catch (ResourceAccessException e) {
+                if (attempt == 1) {
+                    log.warn("[online] 小助手网络异常（第 1 次）：{}，500ms 后重试", message(e));
+                    sleepQuietly(500);
+                    continue;
+                }
+                throw new IllegalStateException("调用小助手失败：" + message(e));
+            }
+        }
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("请求被中断", ie);
+        }
+    }
+
+    /**
+     * 从小助手的 HTML 错误页（ASP.NET 黄页等）提取简短原因，
+     * 优先「异常详细信息」行，其次 title，避免把整页 HTML 灌给前端。
+     */
+    private static String friendlyHttpBody(byte[] body) {
+        String text = body == null ? "" : new String(body, StandardCharsets.UTF_8);
+        if (text.isEmpty()) return "空响应";
+        if (text.charAt(0) == '\uFEFF') text = text.substring(1);
+        // 去掉 <script>/<style>，按标签切行取纯文本
+        String stripped = text.replaceAll("(?is)<(script|style)[^>]*>.*?</\\1>", " ")
+                .replaceAll("(?s)<[^>]*>", "\n");
+        String[] lines = stripped.split("\\r?\\n");
+        String title = null;
+        for (int i = 0; i < lines.length; i++) {
+            String t = lines[i].trim();
+            if (t.isEmpty()) continue;
+            if (title == null) title = t;
+            if (t.startsWith("异常详细信息")) {
+                String detail = htmlDecode(t.replaceFirst("^异常详细信息[:：]?\\s*", "").trim());
+                if (detail.isEmpty()) {
+                    // <i>异常详细信息:</i>System... 会被标签拆成两行，取下一行
+                    for (int j = i + 1; j < lines.length; j++) {
+                        String nxt = lines[j].trim();
+                        if (!nxt.isEmpty()) { detail = htmlDecode(nxt); break; }
+                    }
+                }
+                return detail;
+            }
+            if (t.contains("签名函数验证失败")) {
+                return htmlDecode(t);
+            }
+        }
+        if (title != null && title.length() <= 120) return htmlDecode(title);
+        return truncate(stripped);
+    }
+
+    private static String htmlDecode(String s) {
+        return s.replace("&nbsp;", " ")
+                .replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", "\"").replace("&#39;", "'")
+                .replace("&amp;", "&");
     }
 
     private List<String> splitColumns(Object value) {
