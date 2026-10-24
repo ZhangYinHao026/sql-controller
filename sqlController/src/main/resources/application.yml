@@ -49,6 +49,8 @@ sql-controller:
       permission-suffix: ${SQL_ONLINE_PERMISSION_SUFFIX:sxwhkj@2024}
       # 写入路径：/api/sxwh/updateSql 无需登录态（实测可用）；/api/apply/updateSql 需要登录 token
       path: ${SQL_ONLINE_WRITE_PATH:/api/sxwh/updateSql}
+      # 超时分档（2026-10-24）：DML/未分类 60s；DDL（大表 ALTER 可达分钟级，别让前端先断）单独放宽
       timeout-seconds: 60
+      ddl-timeout-seconds: ${SQL_ONLINE_DDL_TIMEOUT:600}
       allow-delete: true              # 内部开发工具：DELETE/DROP 等由前端二次确认把关
       # 说明：DDL（CREATE/ALTER/DROP/TRUNCATE/RENAME）始终允许——字段对比「本地结构同步到线上」要用

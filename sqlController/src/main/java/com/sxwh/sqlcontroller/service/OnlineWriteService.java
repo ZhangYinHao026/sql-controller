@@ -34,6 +34,8 @@ public class OnlineWriteService {
     private final OnlineProperties properties;
     private final ObjectMapper mapper = new ObjectMapper();
     private final RestTemplate http;
+    /** DDL 档专用：大表 ALTER 可能远超 60s（超时分档，2026-10-24）。 */
+    private final RestTemplate ddlHttp;
     /** 专用于中心加密接口（超时更短，避免写通道被加密服务拖死）。 */
     private final RestTemplate cryptoHttp;
 
@@ -43,6 +45,11 @@ public class OnlineWriteService {
         f.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
         f.setReadTimeout(Math.max(1, properties.getWrite().getTimeoutSeconds()) * 1000);
         this.http = new RestTemplate(f);
+
+        SimpleClientHttpRequestFactory df = new SimpleClientHttpRequestFactory();
+        df.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
+        df.setReadTimeout(Math.max(1, properties.getWrite().getDdlTimeoutSeconds()) * 1000);
+        this.ddlHttp = new RestTemplate(df);
 
         SimpleClientHttpRequestFactory cf = new SimpleClientHttpRequestFactory();
         cf.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
@@ -72,7 +79,8 @@ public class OnlineWriteService {
             String hex = encrypt(plain);
 
             String url = base + properties.getWrite().getPath();
-            ResponseEntity<byte[]> resp = postJsonString(http, url, hex, "写入接口");
+            // 超时分档：DDL（大表 ALTER 可达分钟级）用长档，DML/未分类走 60s 短档
+            ResponseEntity<byte[]> resp = postJsonString(isDdlStatement(sql) ? ddlHttp : http, url, hex, "写入接口");
             String text = bodyText(resp);
 
             String msg;
@@ -111,6 +119,20 @@ public class OnlineWriteService {
         String s = sql == null ? "" : sql.trim();
         String suf = suffix == null ? "" : suffix.trim();
         return suf.isEmpty() ? s : s + "\n" + suf;
+    }
+
+    private static final java.util.Set<String> DDL_VERBS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME"));
+
+    /**
+     * 首词分档：CREATE/ALTER/DROP/TRUNCATE/RENAME → DDL（与本地 {@code DynamicDataSourceService.timeoutFor} 同口径）。
+     * 括号包裹等怪形态保守按 DML 处理。
+     */
+    static boolean isDdlStatement(String sql) {
+        String s = sql == null ? "" : sql.trim();
+        if (s.isEmpty() || s.charAt(0) == '(') return false;
+        String first = s.split("\\s+", 2)[0].toUpperCase(java.util.Locale.ROOT);
+        return DDL_VERBS.contains(first);
     }
 
     /** 生成加密串：remote=中心加密接口（默认），local=本地 SM4，auto=远程失败回落本地。 */

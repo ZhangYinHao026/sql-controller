@@ -46,8 +46,14 @@ public class OnlineProperties {
         private String sm4Key = "";
         /** 权限后缀，明文 SQL 末尾必须带，服务端 strip 后才执行。 */
         private String permissionSuffix = "sxwhkj@2024";
-        /** 写入接口超时秒数。 */
+        /** 写入接口超时秒数（DML/未分类档）。 */
         private int timeoutSeconds = 60;
+        /**
+         * DDL 档写入超时秒数（2026-10-24 用户拍板按语句分档）。
+         * 大表 ALTER 在线上可能远超 60s——数据库还在执行、前端先断会误报失败。
+         * 首词 ∈ CREATE/ALTER/DROP/TRUNCATE/RENAME 走本档（与本地 DynamicDataSourceService.timeoutFor 同口径）。
+         */
+        private int ddlTimeoutSeconds = 600;
         /** 是否允许 DELETE（内部开发工具，默认开；如线上要收紧可置 false）。 */
         private boolean allowDelete = true;
         /** 写入接口路径。默认 {@code /api/sxwh/updateSql}（实测可用；{@code /api/apply/updateSql} 需登录态）。 */
@@ -76,6 +82,8 @@ public class OnlineProperties {
         public void setPermissionSuffix(String permissionSuffix) { this.permissionSuffix = permissionSuffix; }
         public int getTimeoutSeconds() { return timeoutSeconds; }
         public void setTimeoutSeconds(int timeoutSeconds) { this.timeoutSeconds = timeoutSeconds; }
+        public int getDdlTimeoutSeconds() { return ddlTimeoutSeconds; }
+        public void setDdlTimeoutSeconds(int ddlTimeoutSeconds) { this.ddlTimeoutSeconds = ddlTimeoutSeconds; }
         public boolean isAllowDelete() { return allowDelete; }
         public void setAllowDelete(boolean allowDelete) { this.allowDelete = allowDelete; }
         public String getPath() { return path; }

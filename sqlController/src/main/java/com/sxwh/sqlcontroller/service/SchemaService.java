@@ -477,7 +477,7 @@ public class SchemaService {
      * char_length / data_precision / data_scale 还原（见 {@link #composeType}），否则
      * 下游生成的 MySQL 风格 DDL 会出现「VARCHAR 无长度」这类非法定义。
      */
-    private ColumnInfo toColumnInfo(Map<?, ?> row, boolean mysql, Map<String, Boolean> pkCols,
+    static ColumnInfo toColumnInfo(Map<?, ?> row, boolean mysql, Map<String, Boolean> pkCols,
                                     Map<String, String> comments, Map<String, Boolean> identityCols) {
         String column = str(row, "column_name");
         if (column == null) {
@@ -506,12 +506,12 @@ public class SchemaService {
     }
 
     /** 需要「长度」参数的类型（DM/神通字典 char_length 给出声明长度）。 */
-    private static final Set<String> LENGTH_TYPES = new HashSet<>(Arrays.asList(
+    static final Set<String> LENGTH_TYPES = new HashSet<>(Arrays.asList(
             "CHAR", "CHARACTER", "VARCHAR", "VARCHAR2", "NCHAR", "NVARCHAR", "NVARCHAR2",
             "CHARACTER VARYING", "NCHAR VARYING", "BINARY", "VARBINARY", "RAW"));
 
     /** 需要「精度[,标度]」参数的类型。 */
-    private static final Set<String> PRECISION_TYPES = new HashSet<>(Arrays.asList(
+    static final Set<String> PRECISION_TYPES = new HashSet<>(Arrays.asList(
             "NUMBER", "NUMERIC", "DECIMAL", "DEC"));
 
     /**
@@ -557,7 +557,7 @@ public class SchemaService {
     }
 
     /** 宽松数字解析（字典返回可能是 Long / BigDecimal / 字符串）。 */
-    private static Long asLong(String v) {
+    static Long asLong(String v) {
         if (v == null || v.trim().isEmpty()) {
             return null;
         }
@@ -570,7 +570,7 @@ public class SchemaService {
 
     /** 执行结果 rows（过滤非 Map 行），保持行序。 */
     @SuppressWarnings("unchecked")
-    private static List<Map<?, ?>> rowMaps(Map<String, Object> result) {
+    static List<Map<?, ?>> rowMaps(Map<String, Object> result) {
         List<Map<?, ?>> out = new ArrayList<>();
         Object rowsObj = result.get("rows");
         if (rowsObj instanceof List<?>) {
@@ -584,9 +584,14 @@ public class SchemaService {
     }
 
     /** rows 按 table_name 分组（组内保持行序=列序）。 */
-    private Map<String, List<Map<?, ?>>> groupRowsByTable(Map<String, Object> result) {
+    static Map<String, List<Map<?, ?>>> groupRowsByTable(Map<String, Object> result) {
+        return groupRowsByTableRows(rowMaps(result));
+    }
+
+    /** 同上，入参为已解析行（线上快照经小助手分页抓取后复用同一分组逻辑）。 */
+    static Map<String, List<Map<?, ?>>> groupRowsByTableRows(List<? extends Map<?, ?>> rows) {
         Map<String, List<Map<?, ?>>> out = new LinkedHashMap<>();
-        for (Map<?, ?> row : rowMaps(result)) {
+        for (Map<?, ?> row : rows) {
             String table = str(row, "table_name");
             if (table == null) {
                 continue;
@@ -597,9 +602,14 @@ public class SchemaService {
     }
 
     /** rows 按 table_name 分组 → 表内 column_name 小写规范化集合（主键批量）。 */
-    private Map<String, Map<String, Boolean>> groupNameSetByTable(Map<String, Object> result) {
+    static Map<String, Map<String, Boolean>> groupNameSetByTable(Map<String, Object> result) {
+        return groupNameSetByTableRows(rowMaps(result));
+    }
+
+    /** 同上，入参为已解析行。 */
+    static Map<String, Map<String, Boolean>> groupNameSetByTableRows(List<? extends Map<?, ?>> rows) {
         Map<String, Map<String, Boolean>> out = new LinkedHashMap<>();
-        for (Map<?, ?> row : rowMaps(result)) {
+        for (Map<?, ?> row : rows) {
             String table = str(row, "table_name");
             String column = str(row, "column_name");
             if (table == null || column == null) {
@@ -611,9 +621,14 @@ public class SchemaService {
     }
 
     /** rows 按 table_name 分组 → 表内列注释映射（注释批量，comments 或 comment 列皆可）。 */
-    private Map<String, Map<String, String>> groupStringMapByTable(Map<String, Object> result) {
+    static Map<String, Map<String, String>> groupStringMapByTable(Map<String, Object> result) {
+        return groupStringMapByTableRows(rowMaps(result));
+    }
+
+    /** 同上，入参为已解析行。 */
+    static Map<String, Map<String, String>> groupStringMapByTableRows(List<? extends Map<?, ?>> rows) {
         Map<String, Map<String, String>> out = new LinkedHashMap<>();
-        for (Map<?, ?> row : rowMaps(result)) {
+        for (Map<?, ?> row : rows) {
             String table = str(row, "table_name");
             String column = str(row, "column_name");
             if (table == null || column == null) {
@@ -632,17 +647,15 @@ public class SchemaService {
 
     /** 执行结果 rows 里取某列形成小写规范化 Set（用于主键列集合）。 */
     @SuppressWarnings("unchecked")
-    private Map<String, Boolean> queryNameSet(Map<String, Object> result, String key) {
+    static Map<String, Boolean> queryNameSet(Map<String, Object> result, String key) {
+        return queryNameSetRows(rowMaps(result), key);
+    }
+
+    /** 同上，入参为已解析行。 */
+    static Map<String, Boolean> queryNameSetRows(List<? extends Map<?, ?>> rows, String key) {
         Map<String, Boolean> map = new LinkedHashMap<>();
-        Object rowsObj = result.get("rows");
-        if (!(rowsObj instanceof List<?>)) {
-            return map;
-        }
-        for (Object rowObj : (List<?>) rowsObj) {
-            if (!(rowObj instanceof Map)) {
-                continue;
-            }
-            String v = str((Map<?, ?>) rowObj, key);
+        for (Map<?, ?> row : rows) {
+            String v = str(row, key);
             if (v != null) {
                 map.put(norm(v), Boolean.TRUE);
             }
@@ -665,10 +678,15 @@ public class SchemaService {
      * 多约束产生的重复行；position 缺失时按出现顺序排在最后。
      */
     static Map<String, List<IndexInfo>> groupIndexesByTable(Map<String, Object> result) {
+        return groupIndexesByTableRows(rowMaps(result));
+    }
+
+    /** 同上，入参为已解析行（线上快照复用）。 */
+    static Map<String, List<IndexInfo>> groupIndexesByTableRows(List<? extends Map<?, ?>> rows) {
         Map<String, Map<String, IndexInfo>> meta = new LinkedHashMap<>();
         Map<String, Map<String, TreeMap<Integer, String>>> colsOf = new LinkedHashMap<>();
         int missingPos = 0;
-        for (Map<?, ?> row : rowMaps(result)) {
+        for (Map<?, ?> row : rows) {
             String table = str(row, "table_name");
             String index = str(row, "index_name");
             String column = str(row, "column_name");
@@ -715,7 +733,7 @@ public class SchemaService {
     }
 
     /** 该索引行是否唯一（已排除主键；uniqueness 优先，退化到 non_unique）。 */
-    private static boolean isUniqueIndexRow(Map<?, ?> row, String constraintType) {
+    static boolean isUniqueIndexRow(Map<?, ?> row, String constraintType) {
         if ("U".equalsIgnoreCase(constraintType)) {
             return true;
         }
@@ -733,8 +751,13 @@ public class SchemaService {
 
     /** 表注释行 → 表名映射（comments 或 table_comment 列皆可；空注释视为无）。 */
     static Map<String, String> groupTableComments(Map<String, Object> result) {
+        return groupTableCommentsRows(rowMaps(result));
+    }
+
+    /** 同上，入参为已解析行（线上快照复用）。 */
+    static Map<String, String> groupTableCommentsRows(List<? extends Map<?, ?>> rows) {
         Map<String, String> out = new LinkedHashMap<>();
-        for (Map<?, ?> row : rowMaps(result)) {
+        for (Map<?, ?> row : rows) {
             String table = str(row, "table_name");
             if (table == null) {
                 continue;
@@ -779,7 +802,7 @@ public class SchemaService {
     }
 
     /** 把索引/表注释挂到表上（缺失即保持空，不影响列主流程）。 */
-    private void enrichTableMeta(TableInfo info, Map<String, List<IndexInfo>> ixByTable, Map<String, String> cmtByTable) {
+    static void enrichTableMeta(TableInfo info, Map<String, List<IndexInfo>> ixByTable, Map<String, String> cmtByTable) {
         if (info == null) {
             return;
         }
@@ -797,18 +820,16 @@ public class SchemaService {
         }
     }
 
-    /** 执行结果 rows 里取 key 列 → value 列的小写规范化映射（用于注释探测）。 */    @SuppressWarnings("unchecked")
-    private Map<String, String> queryStringMap(Map<String, Object> result, String keyCol, String[] valueCols) {
+    /** 执行结果 rows 里取 key 列 → value 列的小写规范化映射（用于注释探测）。 */
+    @SuppressWarnings("unchecked")
+    static Map<String, String> queryStringMap(Map<String, Object> result, String keyCol, String[] valueCols) {
+        return queryStringMapRows(rowMaps(result), keyCol, valueCols);
+    }
+
+    /** 同上，入参为已解析行。 */
+    static Map<String, String> queryStringMapRows(List<? extends Map<?, ?>> rows, String keyCol, String[] valueCols) {
         Map<String, String> map = new LinkedHashMap<>();
-        Object rowsObj = result.get("rows");
-        if (!(rowsObj instanceof List<?>)) {
-            return map;
-        }
-        for (Object rowObj : (List<?>) rowsObj) {
-            if (!(rowObj instanceof Map)) {
-                continue;
-            }
-            Map<?, ?> row = (Map<?, ?>) rowObj;
+        for (Map<?, ?> row : rows) {
             String key = str(row, keyCol);
             if (key == null) {
                 continue;
@@ -824,23 +845,23 @@ public class SchemaService {
         return map;
     }
 
-    private static String norm(String s) {
+    static String norm(String s) {
         return s == null ? "" : s.trim().toLowerCase(Locale.ROOT);
     }
 
-    private static boolean isNo(String s) {
+    static boolean isNo(String s) {
         return s != null && (s.equalsIgnoreCase("NO") || s.equalsIgnoreCase("N"));
     }
 
-    private static Boolean nullableOrNull(String raw) {
+    static Boolean nullableOrNull(String raw) {
         return raw == null ? null : !isNo(raw);
     }
 
-    private static boolean containsIgnoreCase(String s, String needle) {
+    static boolean containsIgnoreCase(String s, String needle) {
         return s != null && s.toLowerCase(Locale.ROOT).contains(needle.toLowerCase(Locale.ROOT));
     }
 
-    private static String firstNonNull(String a, String b) {
+    static String firstNonNull(String a, String b) {
         return a != null ? a : b;
     }
 
@@ -913,25 +934,22 @@ public class SchemaService {
     }
 
     /** 从 information_schema.tables 查询结果里读取 table_name 列（不区分大小写）。 */
-    @SuppressWarnings("unchecked")
-    private List<String> readTableNames(Map<String, Object> tableResult) {
+    static List<String> readTableNames(Map<String, Object> tableResult) {
+        return readTableNamesRows(rowMaps(tableResult));
+    }
+
+    /** 同上，入参为已解析行（线上快照复用）。 */
+    static List<String> readTableNamesRows(List<? extends Map<?, ?>> rows) {
         List<String> names = new ArrayList<>();
-        Object rowsObj = tableResult.get("rows");
-        if (!(rowsObj instanceof List<?>)) return names;
-        for (Object rowObj : (List<?>) rowsObj) {
-            if (!(rowObj instanceof Map)) continue;
-            Map<String, Object> row = (Map<String, Object>) rowObj;
-            Object name = null;
-            for (Map.Entry<String, Object> e : row.entrySet()) {
-                if ("table_name".equalsIgnoreCase(e.getKey())) { name = e.getValue(); break; }
-            }
-            if (name != null) names.add(name.toString());
+        for (Map<?, ?> row : rows) {
+            String name = str(row, "table_name");
+            if (name != null) names.add(name);
         }
         return names;
     }
 
     /** 系统表过滤：information_schema / sys% / mysql% / 含 $ 的临时表。 */
-    private boolean isSystemTable(String table) {
+    static boolean isSystemTable(String table) {
         String t = table.toLowerCase(Locale.ROOT);
         return t.startsWith("information_schema")
                 || t.startsWith("mysql")
@@ -940,7 +958,7 @@ public class SchemaService {
     }
 
     /** 大小写不敏感取值（MySQL 小写列名 / 达梦可能大写列名）。 */
-    private static String str(Map<?, ?> row, String key) {
+    static String str(Map<?, ?> row, String key) {
         if (row == null) return null;
         for (Map.Entry<?, ?> e : row.entrySet()) {
             if (e.getKey() != null && key.equalsIgnoreCase(e.getKey().toString())) {

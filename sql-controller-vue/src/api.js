@@ -132,6 +132,14 @@ export const api = {
         method: 'POST', timeoutMs: 150000
     }),
     // 线上查询：后端按区域并行（每区域一次小助手请求），跨省网络慢 → 150s 上限
+    // 线上结构快照（字段对比用）：元数据经小助手只读抓取；万级字典行 ≈ 每省 9~21 次分页请求（500/页）
+    onlineSchemaSnapshot: (connectionIds, force) => request('/api/online/schema-snapshot', {
+        method: 'POST', body: JSON.stringify({connectionIds, force: !!force}), timeoutMs: 180000
+    }),
+    // 执行补丁后的线上局部刷新：只抓指定表（跳过缓存）
+    onlineSchemaTables: (connectionId, tableNames) => request('/api/online/schema-snapshot', {
+        method: 'POST', body: JSON.stringify({connectionIds: [connectionId], tables: tableNames}), timeoutMs: 60000
+    }),
     onlineQuery: (body) => request('/api/online/query', {
         method: 'POST', body: JSON.stringify(body), timeoutMs: 150000
     }),

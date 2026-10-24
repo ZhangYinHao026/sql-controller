@@ -24,7 +24,19 @@ import ConfirmDialog from './ConfirmDialog.vue'
 import DiffPatchDialog from './DiffPatchDialog.vue'
 import DiffRow from './DiffRow.vue'
 
-const props = defineProps({show: Boolean, connections: {type: Array, default: () => []}})
+const props = defineProps({
+  show: Boolean,
+  connections: {type: Array, default: () => []},
+  onlineConnections: {type: Array, default: () => []}   // 线上区域（字段对比可选目标）
+})
+/* 线上连接以 'online:<id>' 字符串 id 参与对比（与本地数字 id 空间隔离，避免撞号）。 */
+const isOnlineId = id => typeof id === 'string' && id.startsWith('online:')
+const onlineNumId = id => Number(String(id).slice('online:'.length))
+/** 合并视图：本地连接原样 + 线上连接包一层（id 加前缀、标记 online）。 */
+const allConns = computed(() => [
+  ...props.connections,
+  ...props.onlineConnections.map(c => ({...c, id: 'online:' + c.id, online: true}))
+])
 const emit = defineEmits(['close', 'run', 'toast'])
 
 /* ---------------- 状态 ---------------- */
@@ -55,10 +67,10 @@ let guardCb = null                       // 确认后执行的回调
 
 /* ---------------- 库 / 表访问 ---------------- */
 const libOf = id => libs[id]
-const connOf = id => props.connections.find(c => c.id === id)
+const connOf = id => allConns.value.find(c => c.id === id)
 const libName = id => (libOf(id) && libOf(id).name) || (connOf(id) && connOf(id).regionName) || id
 const libTypeName = id => { const c = connOf(id); return c ? c.dbType : '' }
-const okLibs = computed(() => props.connections.filter(c => libs[c.id] && !libs[c.id].error))
+const okLibs = computed(() => allConns.value.filter(c => libs[c.id] && !libs[c.id].error))
 /** 该连接本会话是否已有成功快照（fetchedAt 非空）。无快照 = 尚未点过拉取 / 拉取失败。 */
 const hasSnap = id => !!(libs[id] && libs[id].fetchedAt)
 // 表名按标识符「忽略大小写」定位：DM/神通未加引号对象一律存储为大写、MySQL 侧常为小写，
@@ -290,7 +302,7 @@ function scopeIds() {
 
 function applySnaps(snaps) {
   snaps.forEach(s => {
-    const conn = props.connections.find(c => c.id === s.connectionId)
+    const conn = allConns.value.find(c => c.id === s.connectionId)
     const key = String(s.connectionId)
     if (!conn) return
     if (s.ok) {
@@ -317,12 +329,23 @@ function applySnaps(snaps) {
 
 /** 「▶ 拉取快照」：按当前勾选范围抓取（优先后端 TTL 缓存）；「⟳ 强制重抓」同范围跳过缓存。 */
 async function fetchAll(force = false) {
-  if (!props.connections.length) return toast('请先在「设置」中添加数据库连接')
+  if (!allConns.value.length) return toast('请先在「设置」中添加数据库连接')
   if (!fetchReady.value) return toast('请先选择基准库并勾选至少一个比对库')
   const ids = scopeIds()
+  const localIds = ids.filter(id => !isOnlineId(id))
+  const onlineIds = ids.filter(isOnlineId).map(onlineNumId)
+  if (!localIds.length && !onlineIds.length) return toast('没有可抓取的库')
   fetching.value = true
   try {
-    const snaps = await api.schemaSnapshot(ids, force)
+    // 本地走 JDBC 快照、线上走小助手字典快照，两路并行；线上结果回填 'online:' 前缀 id
+    const [localSnaps, onlineSnaps] = await Promise.all([
+      localIds.length ? api.schemaSnapshot(localIds, force) : Promise.resolve([]),
+      onlineIds.length ? api.onlineSchemaSnapshot(onlineIds, force) : Promise.resolve([])
+    ])
+    const snaps = [
+      ...(localSnaps || []),
+      ...(onlineSnaps || []).map(item => ({...item, connectionId: 'online:' + item.connectionId}))
+    ]
     applySnaps(snaps)
     const failed = snaps.filter(s => !s.ok).length
     if (failed) toast(`${snaps.length - failed}/${snaps.length} 个库快照成功${failed ? `，${failed} 个失败（详见比对库勾选区）` : ''}`)
@@ -394,7 +417,8 @@ function goCmpTable(id, t) {
   persist()
 }
 function onBaseChange(e) {
-  const next = Number(e.target.value)
+  const rawVal = String(e.target.value)
+  const next = isOnlineId(rawVal) ? rawVal : Number(rawVal)
   if (next === diffBase.value) return
   const nm = libName(next)
   const apply = () => {
@@ -659,7 +683,7 @@ function copyCurPatch(mode) {
 }
 function runCurPatch() {
   const k = patchActive.value
-  if (k && patchBuckets[k] && patchBuckets[k].text.trim()) runBucket(Number(k))
+  if (k && patchBuckets[k] && patchBuckets[k].text.trim()) runBucket(isOnlineId(k) ? k : Number(k))
 }
 /** 单桶执行（异步；onDone 由 App 保证在成功/失败后均回调，返回 Promise 便于 runAll 串行）。 */
 function runBucket(id) {
@@ -759,7 +783,13 @@ async function refreshTablesAfterExec(connId, sqlText) {
   const tables = parsePatchTables(sqlText)
   if (!tables.length) return
   try {
-    const snaps = await api.schemaTables(connId, tables)
+    const raw = isOnlineId(connId)
+      ? await api.onlineSchemaTables(onlineNumId(connId), tables)
+      : await api.schemaTables(connId, tables)
+    // 线上返回数字 id → 回填前缀，保证与本地 libs 键一致
+    const snaps = isOnlineId(connId)
+      ? (Array.isArray(raw) ? raw : [raw]).map(item => ({...item, connectionId: 'online:' + item.connectionId}))
+      : raw
     const list = Array.isArray(snaps) ? snaps : [snaps]
     const snap = list.find(s => s && String(s.connectionId) === String(connId))
     if (!snap || !snap.ok) {
@@ -1079,23 +1109,52 @@ const baseType = computed(() => {
   return c ? c.dbType : ''
 })
 /** 比对库勾选区：按 dbType 分组，排除基准库。 */
-const dbTypeGroups = computed(() => {
-  const map = new Map()
-  props.connections.forEach(c => {
-    if (c.id === diffBase.value) return
-    if (!map.has(c.dbType)) map.set(c.dbType, [])
-    map.get(c.dbType).push(c)
-  })
-  return [...map.entries()].map(([type, list]) => ({type, typeName: typeLabel(type), list}))
+/* 比对库分组：先「本地/线上」两大组，组内再按 dbType；支持按名称/类型搜索；超过阈值折叠（点「…还有 N」展开）。 */
+const CMP_COLLAPSE_AT = 14
+const cmpFilter = ref('')
+const expandedScopes = reactive({local: true, online: true})
+const cmpHit = (c, kw) => !kw || String(c.regionName || '').toLowerCase().includes(kw) || typeLabel(c.dbType).toLowerCase().includes(kw)
+const cmpScopeGroups = computed(() => {
+  const kw = cmpFilter.value.trim().toLowerCase()
+  return [
+    {key: 'local', label: '本地', list: props.connections},
+    {key: 'online', label: '线上', list: allConns.value.filter(c => c.online)}
+  ].map(sc => {
+    const map = new Map()
+    sc.list.forEach(c => {
+      if (c.id === diffBase.value || !cmpHit(c, kw)) return
+      if (!map.has(c.dbType)) map.set(c.dbType, [])
+      map.get(c.dbType).push(c)
+    })
+    const groups = [...map.entries()].map(([type, list]) => ({type, typeName: typeLabel(type), list}))
+    const total = groups.reduce((n, g) => n + g.list.length, 0)
+    const collapsed = !expandedScopes[sc.key] && total > CMP_COLLAPSE_AT
+    let shown = 0
+    return {
+      key: sc.key, label: sc.label, total, collapsed,
+      groups: groups.map(g => {
+        const list = collapsed ? g.list.slice(0, Math.max(0, CMP_COLLAPSE_AT - shown)) : g.list
+        shown += list.length
+        return {...g, list, hidden: g.list.length - list.length}
+      })
+    }
+  }).filter(sc => sc.total > 0)
 })
 /** 基准库下拉：按 dbType 分组全部连接（失败库 disabled）。 */
 const baseSelectGroups = computed(() => {
-  const map = new Map()
-  props.connections.forEach(c => {
-    if (!map.has(c.dbType)) map.set(c.dbType, [])
-    map.get(c.dbType).push(c)
+  const out = []
+  ;[
+    {label: '本地', list: props.connections},
+    {label: '线上', list: allConns.value.filter(c => c.online)}
+  ].forEach(sc => {
+    const map = new Map()
+    sc.list.forEach(c => {
+      if (!map.has(c.dbType)) map.set(c.dbType, [])
+      map.get(c.dbType).push(c)
+    })
+    map.forEach((list, type) => out.push({type: sc.label + '|' + type, typeName: sc.label + ' · ' + typeLabel(type), list}))
   })
-  return [...map.entries()].map(([type, list]) => ({type, typeName: typeLabel(type), list}))
+  return out
 })
 function fmtFetchedAt(id) {
   const lib = libs[id]
@@ -1149,19 +1208,23 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
           </optgroup>
         </select>
         <span class="label">比对库（可多选）</span>
+        <input v-model="cmpFilter" class="input diff-cmp-filter" placeholder="🔍 搜索省份/类型" :disabled="fetching" />
         <div class="diff-cmp-list">
-          <span v-for="g in dbTypeGroups" :key="'g' + g.type" class="diff-cmp-group">
-            <b>{{ g.typeName }}</b>
-            <label v-for="c in g.list" :key="c.id" :class="{ cross: c.dbType !== baseType, 'failed-lib': !!libs[c.id]?.error }"
-                   :title="libs[c.id]?.error ? '快照失败：' + libs[c.id].error : (c.dbType !== baseType ? '跨方言库：生成时按该库方言产出补丁（补丁弹窗默认展示已转换的目标方言脚本），执行按源脚本经转换器下发' : '')">
-              <input type="checkbox" :disabled="fetching || !!libs[c.id]?.error" :checked="diffCmps.includes(c.id)"
-                     @change="toggleCmp(c.id, $event.target.checked)">
-              {{ c.regionName }}<span v-if="libs[c.id]?.error" class="fail-mark">✗</span>
-              <span v-else-if="!hasSnap(c.id)" class="pend-mark" title="尚未拉取该库快照：勾选后点「▶ 拉取快照」抓取结构">待拉取</span>
-              <!-- 顶部对比库勾选区不再渲染「缺N 多N」徽章（明细见下方总览卡 / 单表核对 chips / 左栏表名徽章），cmpMini 函数保留以备恢复 -->
-            </label>
+          <span v-for="sc in cmpScopeGroups" :key="'s' + sc.key" class="diff-cmp-scope" :class="'scope-' + sc.key">
+            <b class="scope-name">{{ sc.label }}</b>
+            <span v-for="g in sc.groups" :key="'g' + sc.key + g.type" class="diff-cmp-group">
+              <b>{{ g.typeName }}</b>
+              <label v-for="c in g.list" :key="c.id" :class="{ cross: c.dbType !== baseType, 'failed-lib': !!libs[c.id]?.error }"
+                     :title="libs[c.id]?.error ? '快照失败：' + libs[c.id].error : (c.dbType !== baseType ? '跨方言库：生成时按该库方言产出补丁（补丁弹窗默认展示已转换的目标方言脚本），执行按源脚本经转换器下发' : '')">
+                <input type="checkbox" :disabled="fetching || !!libs[c.id]?.error" :checked="diffCmps.includes(c.id)"
+                       @change="toggleCmp(c.id, $event.target.checked)">
+                {{ c.regionName }}<span v-if="libs[c.id]?.error" class="fail-mark">✗</span>
+                <span v-else-if="!hasSnap(c.id)" class="pend-mark" title="尚未拉取该库快照：勾选后点「▶ 拉取快照」抓取结构">待拉取</span>
+              </label>
+              <a v-if="g.hidden > 0" class="more-cmp" @click.prevent="expandedScopes[sc.key] = true">…还有 {{ g.hidden }}</a>
+            </span>
           </span>
-          <span v-if="!dbTypeGroups.length" class="muted">无其他库可选</span>
+          <span v-if="!cmpScopeGroups.length" class="muted">{{ cmpFilter ? '没有匹配的库' : '无其他库可选' }}</span>
         </div>
         <button type="button" class="btn small snap-btn" :disabled="!fetchReady || fetching"
                 :title="fetchReady ? '' : '先选择基准库并勾选比对库'" @click="fetchAll(false)">
@@ -1404,6 +1467,13 @@ export default { name: 'SchemaDiffDialog' }
 .diff-toolbar select { border: 1.5px solid var(--ink-100); border-radius: 8px; padding: 6px 10px; background: var(--surface); color: var(--ink-900); font-size: 12.5px; }
 .diff-select { min-width: 150px; }
 .diff-cmp-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+/* 「本地/线上」双组：线上组描一圈薄荷色以示区分（线上=生产库） */
+.diff-cmp-filter { width: 150px; padding: 5px 10px; font-size: 12px; border: 1.5px solid var(--ink-100); border-radius: var(--r-pill); background: var(--surface); color: var(--ink-900); }
+.diff-cmp-scope { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 2px 8px 2px 4px; border-radius: var(--r-pill); }
+.diff-cmp-scope.scope-online { background: var(--mint-50); border: 1px dashed var(--mint-200); }
+.diff-cmp-scope .scope-name { font-size: 11px; font-weight: 800; color: var(--ink-500); padding: 0 6px; border-right: 1px solid var(--ink-100); }
+.diff-cmp-scope.scope-online .scope-name { color: var(--mint-700); border-right-color: var(--mint-200); }
+.more-cmp { font-size: 11px; color: var(--mint-700); cursor: pointer; text-decoration: underline; white-space: nowrap; }
 .diff-cmp-group { display: flex; align-items: center; gap: 2px; background: var(--ink-50); border: 1px solid var(--ink-100); border-radius: var(--r-pill); padding: 3px 5px 3px 10px; }
 .diff-cmp-group b { font-size: 11px; color: var(--ink-500); font-weight: 700; margin-right: 2px; }
 .diff-cmp-group label { display: flex; align-items: center; gap: 3px; font-size: 12px; color: var(--ink-700); padding: 2px 8px; border-radius: var(--r-pill); cursor: pointer; }

@@ -210,6 +210,12 @@ function toggleOnline(id) {
     : [...onlineSelectedIds.value, id]
 }
 
+/** 打开字段对比弹窗：线上连接列表可能还没加载过（只在切线上环境/设置页才拉）→ 这里补一次。 */
+function openDiff() {
+  dialogs.diff = true
+  if (!onlineConnections.value.length && !onlineLoading.value) loadOnline()
+}
+
 function toggleAllOnline() {
   const ids = currentOnlineConnections.value.map(item => item.id)
   onlineSelectedIds.value = ids.length && ids.every(id => onlineSelectedIds.value.includes(id)) ? [] : ids
@@ -489,7 +495,12 @@ function notifyDiff(res) {
 async function runDiffScript(payload) {
   diffReport = typeof payload?.onDone === 'function' ? payload.onDone : null
   const rawSql = (payload?.sql || '').trim()
-  const conn = connections.value.find(item => item.id === payload?.connectionId)
+  // 线上目标 id 形如 'online:3'（SchemaDiffDialog 传入），与本地数字 id 空间隔离
+  const onlineId = typeof payload?.connectionId === 'string' && payload.connectionId.startsWith('online:')
+    ? Number(payload.connectionId.slice('online:'.length)) : null
+  const conn = onlineId != null && !Number.isNaN(onlineId)
+    ? onlineConnections.value.find(item => item.id === onlineId)
+    : connections.value.find(item => item.id === payload?.connectionId)
   if (!rawSql || !conn) { notifyDiff({ok: false, error: '没有可执行的同步脚本或目标库连接已删除'}); return toast('没有可执行的同步脚本或目标库连接已删除') }
   let text = rawSql
   let warnings = []
@@ -506,6 +517,38 @@ async function runDiffScript(payload) {
     } catch (e) {
       notifyDiff({ok: false, error: `跨方言转换失败：${e.message}`}); return toast(`跨方言转换失败：${e.message}`)
     }
+  }
+  if (onlineId != null) {
+    // 线上补丁：经中心加密接口 → 该省 updateSql；线上生产库一律强制二次确认（cancelConfirm 会回调 notifyDiff 防卡「执行中」）
+    const runOnline = async () => {
+      const t0 = Date.now()
+      try {
+        const data = await api.onlineWrite({connectionId: conn.id, sql: text, confirmed: true})
+        const hit = (data?.results || [])[0]
+        const ok = !!hit && hit.status === 'SUCCESS'
+        if (hit) {
+          results.value = [...results.value, hit]
+          cardPages[hit.connectionId] = 1
+          cardSql[hit.connectionId] = text
+          logs.value.unshift({...hit, sql: text, time: new Date().toLocaleString('zh-CN', {hour12: false})})
+        }
+        if (ok) {
+          notifyDiff({ok: true, ms: Date.now() - t0, rows: hit.affectedRows != null ? Number(hit.affectedRows) : null})
+          toast(`已执行到线上「${conn.regionName}」成功`)
+        } else {
+          notifyDiff({ok: false, error: hit?.errorMessage || '写入失败', ms: Date.now() - t0})
+          toast(`线上执行失败：${hit?.errorMessage || '未知错误'}`)
+        }
+      } catch (e) {
+        notifyDiff({ok: false, error: e.message, ms: Date.now() - t0})
+        toast('线上执行失败：' + e.message)
+      }
+    }
+    Object.assign(confirm, {
+      show: true, sql: text, targets: [{...conn, regionName: `${conn.regionName}（线上）`}], warnings,
+      action: runOnline
+    })
+    return
   }
   // 回填编辑器 + 切到目标库型并只预选该连接（结果在主区正常展示）
   // 注意：不关闭字段对比面板 —— 执行后 SchemaDiffDialog 侧分桶状态就地更新（✓已执行 / ✗失败可重试），
@@ -894,7 +937,7 @@ onMounted(async () => {
     <nav class="topbar-nav">
       <button class="theme-btn" type="button" title="主题切换（敬请期待）" aria-label="主题切换">🌙</button>
       <button class="nav-btn" @click="openHistory">📜 历史记录</button>
-      <button class="nav-btn" @click="dialogs.diff = true">⇆ 字段对比</button>
+      <button class="nav-btn" @click="openDiff()">⇆ 字段对比</button>
       <button class="nav-btn" @click="openSettings">⚙ 设置</button>
     </nav>
   </header>
@@ -1063,7 +1106,7 @@ onMounted(async () => {
                  :page-size="historyPageSize" :total="historyTotal"
                  @close="dialogs.history = false" @page="loadHistory" @page-size-change="changeHistoryPageSize"/>
   <ConvertDialog :show="dialogs.convert" :connections="connections" @close="dialogs.convert = false" @use-result="runConverted" @execute-all="runConvertedAll"/>
-  <SchemaDiffDialog :show="dialogs.diff" :connections="connections" @close="dialogs.diff = false"
-                    @run="runDiffScript" @toast="toast"/>
+  <SchemaDiffDialog :show="dialogs.diff" :connections="connections" :online-connections="onlineConnections"
+                    @close="dialogs.diff = false" @run="runDiffScript" @toast="toast"/>
   <div v-if="notice" class="toast">{{ notice }}</div>
 </template>

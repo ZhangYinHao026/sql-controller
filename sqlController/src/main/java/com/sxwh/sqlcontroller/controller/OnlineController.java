@@ -1,9 +1,12 @@
 package com.sxwh.sqlcontroller.controller;
 
 import com.sxwh.sqlcontroller.model.OnlineConnection;
+import com.sxwh.sqlcontroller.model.SchemaSnapshot;
+import com.sxwh.sqlcontroller.model.SchemaSnapshotRequest;
 import com.sxwh.sqlcontroller.service.OnlineConnectionService;
 import com.sxwh.sqlcontroller.service.OnlineQueryService;
 import com.sxwh.sqlcontroller.service.OnlineRegionCatalogService;
+import com.sxwh.sqlcontroller.service.OnlineSchemaService;
 import com.sxwh.sqlcontroller.service.OnlineWriteService;
 import org.springframework.web.bind.annotation.*;
 
@@ -23,13 +26,15 @@ public class OnlineController {
     private final OnlineRegionCatalogService catalog;
     private final OnlineQueryService query;
     private final OnlineWriteService write;
+    private final OnlineSchemaService onlineSchema;
 
     public OnlineController(OnlineConnectionService connections, OnlineRegionCatalogService catalog,
-                            OnlineQueryService query, OnlineWriteService write) {
+                            OnlineQueryService query, OnlineWriteService write, OnlineSchemaService onlineSchema) {
         this.connections = connections;
         this.catalog = catalog;
         this.query = query;
         this.write = write;
+        this.onlineSchema = onlineSchema;
     }
 
     /** 服务地址等只读信息（不含任何密钥）。 */
@@ -94,6 +99,19 @@ public class OnlineController {
     @GetMapping("/regions")
     public Map<String, Object> regions(@RequestParam(required = false) String ver) {
         return catalog.regions(ver);
+    }
+
+    /**
+     * 线上结构快照（字段对比用）：与本地 {@code /api/diff/schema-snapshot} 同构，
+     * 但元数据经小助手只读抓取（按方言选字典：MySQL=information_schema，达梦/神通=all_tab_columns 系）。
+     * req.tables 非空 = 执行补丁后的局部刷新（只抓这些表，跳过缓存）。
+     */
+    @PostMapping("/schema-snapshot")
+    public List<SchemaSnapshot> schemaSnapshot(@RequestBody SchemaSnapshotRequest req) {
+        boolean force = req != null && req.isForce();
+        List<Long> ids = req == null ? null : req.getConnectionIds();
+        List<String> tables = req == null ? null : req.getTables();
+        return onlineSchema.snapshots(ids, force, tables);
     }
 
     /** 一键导入该版本下全部 java 区域（已存在的跳过）。 */
