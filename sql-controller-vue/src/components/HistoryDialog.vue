@@ -74,7 +74,7 @@ const filtered = computed(() => {
             <div class="history-item-head">
               <span class="history-region">{{ item.regionName }} · {{ item.sqlType }}</span>
               <span :class="item.status === 'SUCCESS' ? 'status ok' : 'status failed'">{{ item.status === 'SUCCESS' ? '成功' : '失败' }}</span>
-              <span class="history-meta">{{ formatTime(item.createdAt) }} · {{ item.durationMs }} ms · 影响 {{ item.affectedRows }} 行</span>
+              <span class="history-meta">{{ formatTime(item.createdAt) }} · {{ item.durationMs }} ms · 影响 {{ item.affectedRows }} 行<template v-if="item.clientIp"> · IP {{ item.clientIp }}</template></span>
             </div>
             <code>{{ item.sqlText }}</code>
             <small v-if="item.errorMessage" class="history-err" :title="item.errorMessage">{{ item.errorMessage }}</small>

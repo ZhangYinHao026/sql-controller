@@ -65,6 +65,23 @@ public class ScriptSchemaMigration implements ApplicationRunner {
             jdbc.execute("ALTER TABLE sql_execution_history ADD COLUMN script_name VARCHAR(200) NULL COMMENT '执行脚本名称' AFTER script_node_id");
         if (columns.contains("params_summary"))
             jdbc.execute("ALTER TABLE sql_execution_history DROP COLUMN params_summary");
+        if (!columns.contains("client_ip"))
+            jdbc.execute("ALTER TABLE sql_execution_history ADD COLUMN client_ip VARCHAR(64) NULL COMMENT '操作人 IP（X-Forwarded-For 首段）' AFTER affected_rows");
+        // 线上写入也要进历史（审计），其 connection_id 为空 → 老库的 NOT NULL 需放开（仅必要时执行）
+        if (connectionIdRequired())
+            jdbc.execute("ALTER TABLE sql_execution_history MODIFY COLUMN connection_id BIGINT NULL COMMENT '数据库连接 ID（线上写入为空）'");
+    }
+
+    /** sql_execution_history.connection_id 是否仍为 NOT NULL（老库）。 */
+    private boolean connectionIdRequired() {
+        try {
+            List<Map<String, Object>> rows = jdbc.queryForList("SHOW COLUMNS FROM sql_execution_history LIKE 'connection_id'");
+            for (Map<String, Object> row : rows) {
+                return !"YES".equalsIgnoreCase(String.valueOf(row.get("Null")));
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     private Set<String> columns(String table) {

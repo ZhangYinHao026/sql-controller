@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS database_connection (
 CREATE TABLE IF NOT EXISTS sql_execution_history (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   request_id VARCHAR(64) NOT NULL COMMENT '请求追踪 ID',
-  connection_id BIGINT NOT NULL COMMENT '数据库连接 ID',
+  connection_id BIGINT NULL COMMENT '数据库连接 ID（线上写入为空）',
   script_node_id BIGINT NULL COMMENT '关联脚本节点 ID',
   script_name VARCHAR(200) NULL COMMENT '执行脚本名称',
   db_type VARCHAR(20) NOT NULL COMMENT '数据库类型',
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS sql_execution_history (
   execution_mode VARCHAR(20) NOT NULL COMMENT '执行模式',
   status VARCHAR(20) NOT NULL COMMENT '执行状态',
   affected_rows BIGINT DEFAULT 0 COMMENT '影响行数',
+  client_ip VARCHAR(64) NULL COMMENT '操作人 IP（X-Forwarded-For 首段）',
   duration_ms BIGINT DEFAULT 0 COMMENT '执行耗时，单位毫秒',
   error_message TEXT COMMENT '错误信息',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',

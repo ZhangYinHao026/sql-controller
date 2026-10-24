@@ -13,17 +13,15 @@ public class HistoryRepository {
         jdbc = j;
     }
 
-    public void save(String req, Long cid, String type, String region, String sql, String kind, String mode, String status, long affected, long duration, String error) {
-        save(req, cid, null, null, type, region, sql, kind, mode, status, affected, duration, error);
-    }
-
-    /** 保存执行记录。 */
-    public void save(String req, Long cid, Long scriptNodeId, String scriptName, String type, String region, String sql, String kind, String mode, String status, long affected, long duration, String error) {
-        jdbc.update("insert into sql_execution_history(request_id,connection_id,script_node_id,script_name,db_type,region_name,sql_text,sql_type,execution_mode,status,affected_rows,duration_ms,error_message) values(?,?,?,?,?,?,?,?,?,?,?,?,?)", req, cid, scriptNodeId, scriptName, type, region, sql, kind, mode, status, affected, duration, error);
+    /** 保存执行记录（带操作人 IP；线上写入时 connectionId 为空、type='online'）。 */
+    public void save(String req, Long cid, Long scriptNodeId, String scriptName, String type, String region, String sql,
+                     String kind, String mode, String status, long affected, String clientIp, long duration, String error) {
+        jdbc.update("insert into sql_execution_history(request_id,connection_id,script_node_id,script_name,db_type,region_name,sql_text,sql_type,execution_mode,status,affected_rows,client_ip,duration_ms,error_message) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                req, cid, scriptNodeId, scriptName, type, region, sql, kind, mode, status, affected, clientIp, duration, error);
     }
 
     public List<Map<String, Object>> list(int page, int size, String type, String region, String status) {
-        String q = "select id,request_id as requestId,connection_id as connectionId,script_node_id as scriptNodeId,script_name as scriptName,db_type as dbType,region_name as regionName,sql_text as sqlText,sql_type as sqlType,execution_mode as executionMode,status,affected_rows as affectedRows,duration_ms as durationMs,error_message as errorMessage,created_at as createdAt from sql_execution_history where (? is null or db_type=?) and (? is null or region_name like ?) and (? is null or status=?) order by id desc limit ? offset ?";
+        String q = "select id,request_id as requestId,connection_id as connectionId,script_node_id as scriptNodeId,script_name as scriptName,db_type as dbType,region_name as regionName,sql_text as sqlText,sql_type as sqlType,execution_mode as executionMode,status,affected_rows as affectedRows,client_ip as clientIp,duration_ms as durationMs,error_message as errorMessage,created_at as createdAt from sql_execution_history where (? is null or db_type=?) and (? is null or region_name like ?) and (? is null or status=?) order by id desc limit ? offset ?";
         String r = region == null || region.trim().isEmpty() ? null : "%" + region.trim() + "%";
         return jdbc.queryForList(q, type, type, r, r, status, status, size, (page - 1) * size);
     }
@@ -37,6 +35,6 @@ public class HistoryRepository {
     }
 
     public Map<String, Object> get(Long id) {
-        return jdbc.queryForMap("select id,request_id as requestId,connection_id as connectionId,script_node_id as scriptNodeId,script_name as scriptName,db_type as dbType,region_name as regionName,sql_text as sqlText,sql_type as sqlType,execution_mode as executionMode,status,affected_rows as affectedRows,duration_ms as durationMs,error_message as errorMessage,created_at as createdAt from sql_execution_history where id=?", id);
+        return jdbc.queryForMap("select id,request_id as requestId,connection_id as connectionId,script_node_id as scriptNodeId,script_name as scriptName,db_type as dbType,region_name as regionName,sql_text as sqlText,sql_type as sqlType,execution_mode as executionMode,status,affected_rows as affectedRows,client_ip as clientIp,duration_ms as durationMs,error_message as errorMessage,created_at as createdAt from sql_execution_history where id=?", id);
     }
 }

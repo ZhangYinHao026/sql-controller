@@ -5,6 +5,8 @@ import com.sxwh.sqlcontroller.model.ExecuteRequest;
 import com.sxwh.sqlcontroller.model.ScriptNode;
 import com.sxwh.sqlcontroller.config.SqlControllerProperties;
 import com.sxwh.sqlcontroller.repository.HistoryRepository;
+import com.sxwh.sqlcontroller.util.WebUtil;
+import javax.servlet.http.HttpServletRequest;
 import com.sxwh.sqlcontroller.service.DatabaseConnectionService;
 import com.sxwh.sqlcontroller.service.DynamicDataSourceService;
 import com.sxwh.sqlcontroller.service.ScriptNodeService;
@@ -59,7 +61,7 @@ public class SqlExecutionController {
      * 带 scriptNodeId 时必须读取服务端保存的脚本，客户端 SQL 仅用于一致性校验，不能替代脚本内容。
      */
     @PostMapping("/execute")
-    public Map<String, Object> execute(@RequestBody ExecuteRequest request) {
+    public Map<String, Object> execute(@RequestBody ExecuteRequest request, HttpServletRequest httpRequest) {
         if (request.getConnectionIds() == null || request.getConnectionIds().isEmpty()) {
             throw new IllegalArgumentException("至少选择一个连接");
         }
@@ -76,6 +78,9 @@ public class SqlExecutionController {
                 : parameterService.bind(sourceSql, request.getParams());
         String sqlType = bound.getSql().trim().split("\\s+")[0].toUpperCase();
         boolean write = Arrays.asList("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE").contains(sqlType);
+        // 历史只留写操作（2026-10-24 用户要求）：SELECT/SHOW/DESC/DESCRIBE/EXPLAIN/WITH 一律不入库（成功/失败/取消都不记）
+        boolean readOnlyHistory = Arrays.asList("SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN", "WITH").contains(sqlType);
+        String clientIp = WebUtil.clientIp(httpRequest);
         if (write && !Boolean.TRUE.equals(request.getConfirmed())) throw new IllegalStateException("写操作必须确认");
 
         String requestId = request.getRequestId() == null ? UUID.randomUUID().toString() : request.getRequestId();
@@ -109,18 +114,18 @@ public class SqlExecutionController {
                     item.put("dbType", connection.getDbType());
                     item.put("regionName", connection.getRegionName());
                     item.put("status", "SUCCESS");
-                    history.save(requestId, connectionId, script == null ? null : script.getId(), script == null ? null : script.getName(),
+                    if (!readOnlyHistory) history.save(requestId, connectionId, script == null ? null : script.getId(), script == null ? null : script.getName(),
                             connection.getDbType(), connection.getRegionName(), sourceSql, sqlType, executionMode, "SUCCESS",
-                            ((Number) item.get("affectedRows")).longValue(), System.currentTimeMillis() - started, null);
+                            ((Number) item.get("affectedRows")).longValue(), clientIp, System.currentTimeMillis() - started, null);
                     results.add(item);
                     success++;
                 } catch (Exception exception) {
                     // 被用户取消的库不算普通失败：标记 CANCELLED 并停止执行剩余库
                     if (cancellation.isCancelled(requestId)) {
                         String detail = "查询已被用户取消" + (exception.getMessage() == null ? "" : "（" + exception.getMessage() + "）");
-                        history.save(requestId, connectionId, script == null ? null : script.getId(), script == null ? null : script.getName(),
+                        if (!readOnlyHistory) history.save(requestId, connectionId, script == null ? null : script.getId(), script == null ? null : script.getName(),
                                 connection.getDbType(), connection.getRegionName(), sourceSql, sqlType, executionMode, "FAILED",
-                                0, System.currentTimeMillis() - started, detail);
+                                0, clientIp, System.currentTimeMillis() - started, detail);
                         Map<String, Object> item = new LinkedHashMap<>();
                         item.put("connectionId", connectionId);
                         item.put("dbType", connection.getDbType());
@@ -130,9 +135,9 @@ public class SqlExecutionController {
                         results.add(item);
                         break;
                     }
-                    history.save(requestId, connectionId, script == null ? null : script.getId(), script == null ? null : script.getName(),
+                    if (!readOnlyHistory) history.save(requestId, connectionId, script == null ? null : script.getId(), script == null ? null : script.getName(),
                             connection.getDbType(), connection.getRegionName(), sourceSql, sqlType, executionMode, "FAILED",
-                            0, System.currentTimeMillis() - started, exception.getMessage());
+                            0, clientIp, System.currentTimeMillis() - started, exception.getMessage());
                     Map<String, Object> item = new LinkedHashMap<>();
                     item.put("connectionId", connectionId);
                     item.put("dbType", connection.getDbType());

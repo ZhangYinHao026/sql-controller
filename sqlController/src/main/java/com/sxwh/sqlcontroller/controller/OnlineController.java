@@ -8,6 +8,9 @@ import com.sxwh.sqlcontroller.service.OnlineQueryService;
 import com.sxwh.sqlcontroller.service.OnlineRegionCatalogService;
 import com.sxwh.sqlcontroller.service.OnlineSchemaService;
 import com.sxwh.sqlcontroller.service.OnlineWriteService;
+import com.sxwh.sqlcontroller.repository.HistoryRepository;
+import com.sxwh.sqlcontroller.util.WebUtil;
+import javax.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.*;
@@ -27,14 +30,17 @@ public class OnlineController {
     private final OnlineQueryService query;
     private final OnlineWriteService write;
     private final OnlineSchemaService onlineSchema;
+    private final HistoryRepository history;
 
     public OnlineController(OnlineConnectionService connections, OnlineRegionCatalogService catalog,
-                            OnlineQueryService query, OnlineWriteService write, OnlineSchemaService onlineSchema) {
+                            OnlineQueryService query, OnlineWriteService write, OnlineSchemaService onlineSchema,
+                            HistoryRepository history) {
         this.connections = connections;
         this.catalog = catalog;
         this.query = query;
         this.write = write;
         this.onlineSchema = onlineSchema;
+        this.history = history;
     }
 
     /** 服务地址等只读信息（不含任何密钥）。 */
@@ -146,7 +152,7 @@ public class OnlineController {
      * 请求：{@code {connectionId, sql, confirmed:true}}；响应与查询同构（results 只有一项）。
      */
     @PostMapping("/write")
-    public Map<String, Object> doWrite(@RequestBody Map<String, Object> body) {
+    public Map<String, Object> doWrite(@RequestBody Map<String, Object> body, HttpServletRequest httpRequest) {
         Long id = toLong(body.get("connectionId"));
         if (id == null) throw new IllegalArgumentException("写入必须指定唯一区域");
         Object ids = body.get("connectionIds");
@@ -157,10 +163,28 @@ public class OnlineController {
         boolean ok = Boolean.TRUE.equals(confirmed) || "true".equals(String.valueOf(confirmed));
         if (!ok) throw new IllegalStateException("写操作必须确认");
 
-        Map<String, Object> item = write.write(connections.get(id), sql);
+        OnlineConnection conn = connections.get(id);
+        long started = System.currentTimeMillis();
+        Map<String, Object> item = write.write(conn, sql);
+        // 线上写入进历史（审计）：connection_id 为空、db_type='online'、region 带「线上」标识、记录操作人 IP。
+        // 线上查询不记（与本地「历史只留写操作」口径一致）。
+        String sqlType = String.valueOf(sql.trim().split("\\s+")[0]).toUpperCase(Locale.ROOT);
+        String status = String.valueOf(item.getOrDefault("status", "FAILED"));
+        history.save(UUID.randomUUID().toString(), null, null, null, "online", conn.getRegionName() + "（线上）", sql,
+                sqlType, "ONLINE", status, parseLong(item.get("affectedRows")), WebUtil.clientIp(httpRequest),
+                System.currentTimeMillis() - started, (String) item.get("errorMessage"));
         List<Map<String, Object>> results = new ArrayList<>();
         results.add(item);
         return envelope(1, results);
+    }
+
+    private static long parseLong(Object v) {
+        if (v instanceof Number) return ((Number) v).longValue();
+        try {
+            return v == null ? 0L : (long) Double.parseDouble(String.valueOf(v));
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 
     private Map<String, Object> envelope(int total, List<Map<String, Object>> results) {
