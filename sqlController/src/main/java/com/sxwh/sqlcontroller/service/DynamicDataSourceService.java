@@ -103,6 +103,42 @@ public class DynamicDataSourceService {
     }
 
     /**
+     * 表浏览导出用：只取前 {@code maxRows} 行，不做 COUNT（导出不需要总数，避免大表二次全表扫描）。
+     *
+     * <p>与 {@link #execute} 的区别：跳过 {@code normalizePageSize} 的 100 行上限，
+     * 上限由调用方（导出接口）按行数预算控制。
+     */
+    public Map<String, Object> executeForExport(DatabaseConnection connection, String sql, List<Object> parameters,
+                                                int maxRows) throws Exception {
+        JdbcPlatform platform = platforms.get(connection.getDbType());
+        Class.forName(resolveDriver(connection, platform));
+        int limit = Math.max(1, maxRows);
+        JdbcPagedSql paged = platform.page(sql, 1, limit);
+        List<Object> values = new ArrayList<>(parameters == null ? Collections.emptyList() : parameters);
+        values.addAll(paged.getParameters());
+        long started = System.currentTimeMillis();
+        try (Connection jdbcConnection = DriverManager.getConnection(resolveUrl(connection, platform), connection.getUsername(), connection.getPassword());
+             PreparedStatement statement = jdbcConnection.prepareStatement(paged.getSql())) {
+            statement.setQueryTimeout(timeoutFor(sql));
+            cancellation.track(statement);
+            try {
+                bind(statement, values);
+                Map<String, Object> result = baseResult(1, limit, started);
+                if (statement.execute()) {
+                    try (ResultSet resultSet = statement.getResultSet()) {
+                        readResultSet(resultSet, result);
+                    }
+                }
+                result.put("total", (long) ((List<?>) result.get("rows")).size());
+                result.put("durationMs", System.currentTimeMillis() - started);
+                return result;
+            } finally {
+                cancellation.untrack();
+            }
+        }
+    }
+
+    /**
      * 执行 SQL。SELECT/WITH 将分页与统计下推给平台，其他语句不包装分页。
      * 业务参数和分页参数均通过 PreparedStatement 绑定。
      * 默认非单事务（每条语句各自自动提交），兼容历史调用。

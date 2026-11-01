@@ -67,6 +67,18 @@ public abstract class AbstractDialect implements Dialect {
         return id;
     }
 
+    /**
+     * 无条件加双引号（达梦/神通/Oracle 兼容写法）。
+     * 不折叠大小写：名字来自结构快照，即库内真实存储的大小写，加引号后必定命中。
+     */
+    @Override
+    public String quoteAlways(String identifier) {
+        if (identifier == null) {
+            return null;
+        }
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
     /** 标识符统一大写输出（达梦/神通默认大小写敏感，不带引号的标识符在库内折叠为大写）。 */
     protected boolean uppercaseIdentifiers() {
         return false;

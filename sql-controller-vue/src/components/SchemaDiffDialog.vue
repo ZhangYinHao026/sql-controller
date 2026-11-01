@@ -1484,15 +1484,15 @@ export default { name: 'SchemaDiffDialog' }
 .fail-mark { color: var(--danger); font-weight: 800; }
 /* 比对库勾选 label 上的该库 vs 基准 微型差异徽章 */
 .cmp-mini { font-size: 10px; font-weight: 800; border-radius: var(--r-pill); padding: 0 6px; line-height: 15px; white-space: nowrap; }
-.cmp-mini.diff { background: #FDEBD9; color: #A76A12; }
+.cmp-mini.diff { background: var(--tint-add-bg); color: var(--tint-add-ink); }
 .cmp-mini.ok { background: var(--mint-100); color: var(--mint-700); }
-.pend-mark { font-size: 10px; font-weight: 800; color: #A76A12; background: #FDEBD9; border-radius: var(--r-pill); padding: 0 6px; line-height: 15px; }
+.pend-mark { font-size: 10px; font-weight: 800; color: var(--tint-add-ink); background: var(--tint-add-bg); border-radius: var(--r-pill); padding: 0 6px; line-height: 15px; }
 .snap-btn { margin-left: auto; }
 .snap-stamp { font-size: 11px; color: var(--ink-300); }
 .patch-entry { display: inline-flex; align-items: center; gap: 6px; }
-.patch-entry.has { border-color: var(--cream-300, #EAC98A); background: linear-gradient(180deg, #FFFDF7, #FFF6E0); color: #8A6210; }
-.patch-entry.has:hover { border-color: #D9B25C; }
-.patch-entry-cnt { font-size: 10.5px; font-weight: 800; background: var(--cream-200); color: #8A6210; border-radius: var(--r-pill); padding: 0 8px; line-height: 16px; }
+.patch-entry.has { border-color: var(--cream-300); background: linear-gradient(180deg, var(--grad-panel-a), var(--cream-50)); color: var(--amber-ink2); }
+.patch-entry.has:hover { border-color: var(--amber-border); }
+.patch-entry-cnt { font-size: 10.5px; font-weight: 800; background: var(--cream-200); color: var(--amber-ink2); border-radius: var(--r-pill); padding: 0 8px; line-height: 16px; }
 .reset-link { background: none; border: 0; color: var(--mint-600); font-size: 12px; cursor: pointer; font-weight: 600; }
 .reset-link:hover { text-decoration: underline; }
 
@@ -1512,11 +1512,11 @@ export default { name: 'SchemaDiffDialog' }
 .diff-table-item .tn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .diff-tbadge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: var(--r-pill); flex: 0 0 auto; white-space: nowrap; }
 .diff-tbadge.ok { background: var(--mint-100); color: var(--mint-600); }
-.diff-tbadge.add { background: #FDEBD9; color: #A76A12; }
-.diff-tbadge.drop { background: #FFE4EC; color: #C2525F; }
-.diff-tbadge.alt { background: #E3EEFB; color: #3E6DA8; }
-.diff-tbadge.pk { background: #F1E7F7; color: #83539E; }
-.diff-tbadge.missing { background: #F5E3E0; color: #A84A3F; }
+.diff-tbadge.add { background: var(--tint-add-bg); color: var(--tint-add-ink); }
+.diff-tbadge.drop { background: var(--tint-drop-bg); color: var(--tint-drop-ink); }
+.diff-tbadge.alt { background: var(--tint-alt-bg); color: var(--tint-alt-ink); }
+.diff-tbadge.pk { background: var(--tint-pk-bg); color: var(--tint-pk-ink); }
+.diff-tbadge.missing { background: var(--tint-missing-bg); color: var(--tint-missing-ink); }
 .diff-tbadge.applied { background: var(--mint-400); color: #fff; }
 .diff-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 10.5px; color: var(--ink-500); flex: 0 0 auto; }
 .lg { display: inline-flex; align-items: center; gap: 4px; }
@@ -1541,12 +1541,12 @@ export default { name: 'SchemaDiffDialog' }
 .ov-card-head .nm { font-weight: 800; color: var(--ink-900); }
 .ov-card-head .ty { font-size: 10.5px; color: var(--ink-500); border: 1px solid var(--ink-200); border-radius: 4px; padding: 0 6px; }
 .ov-card-head .st { font-size: 11.5px; font-weight: 700; padding: 1px 9px; border-radius: var(--r-pill); }
-.ov-card-head .st.add { background: #FDEBD9; color: #A76A12; }
-.ov-card-head .st.drop { background: #FFE4EC; color: #C2525F; }
-.ov-card-head .st.alt { background: #E3EEFB; color: #3E6DA8; }
-.ov-card-head .st.pk { background: #F1E7F7; color: #83539E; }
+.ov-card-head .st.add { background: var(--tint-add-bg); color: var(--tint-add-ink); }
+.ov-card-head .st.drop { background: var(--tint-drop-bg); color: var(--tint-drop-ink); }
+.ov-card-head .st.alt { background: var(--tint-alt-bg); color: var(--tint-alt-ink); }
+.ov-card-head .st.pk { background: var(--tint-pk-bg); color: var(--tint-pk-ink); }
 .ov-card-head .st.clean { background: var(--mint-100); color: var(--mint-700); }
-.ov-card-head .st.pending { background: #FDEBD9; color: #A76A12; }
+.ov-card-head .st.pending { background: var(--tint-add-bg); color: var(--tint-add-ink); }
 .ov-card-actions { margin-left: auto; display: flex; gap: 6px; }
 .ov-table { width: 100%; border-collapse: collapse; }
 .ov-table td { padding: 6px 10px; font-size: 12px; vertical-align: top; border-bottom: 1px dashed var(--ink-100); }
@@ -1554,18 +1554,18 @@ export default { name: 'SchemaDiffDialog' }
 .ov-tbl-name { font-family: var(--font-mono); font-weight: 700; color: var(--ink-900); white-space: nowrap; }
 .ov-badge { font-size: 11px; font-weight: 800; padding: 0 6px; border-radius: 4px; line-height: 16px; }
 .ov-badge.zero { color: var(--mint-600); background: var(--mint-50); }
-.ov-badge.b-add { color: #A76A12; background: #FDEBD9; }
-.ov-badge.b-drop { color: #C2525F; background: #FFE4EC; }
-.ov-badge.b-alt { color: #3E6DA8; background: #E3EEFB; }
-.ov-badge.b-pk { color: #83539E; background: #F1E7F7; }
-.ov-badge.b-missing { color: #A84A3F; background: #F5E3E0; }
+.ov-badge.b-add { color: var(--tint-add-ink); background: var(--tint-add-bg); }
+.ov-badge.b-drop { color: var(--tint-drop-ink); background: var(--tint-drop-bg); }
+.ov-badge.b-alt { color: var(--tint-alt-ink); background: var(--tint-alt-bg); }
+.ov-badge.b-pk { color: var(--tint-pk-ink); background: var(--tint-pk-bg); }
+.ov-badge.b-missing { color: var(--tint-missing-ink); background: var(--tint-missing-bg); }
 .ov-cols { font-size: 11px; color: var(--ink-500); font-family: var(--font-mono); line-height: 1.7; }
 .ov-cols-missing { display: flex; align-items: center; gap: 8px; font-family: inherit; margin-top: 2px; flex-wrap: wrap; }
-.ov-col-add { color: #A76A12; }
-.ov-col-drop { color: #C2525F; }
-.ov-col-alt { color: #3E6DA8; }
+.ov-col-add { color: var(--tint-add-ink); }
+.ov-col-drop { color: var(--tint-drop-ink); }
+.ov-col-alt { color: var(--tint-alt-ink); }
 .ov-empty { padding: 18px; text-align: center; color: var(--ink-300); font-size: 12px; }
-.missing-table .mt-title { font-size: 14px; color: #A84A3F; font-weight: 800; margin-bottom: 10px; }
+.missing-table .mt-title { font-size: 14px; color: var(--tint-missing-ink); font-weight: 800; margin-bottom: 10px; }
 .missing-table .mt-desc { font-size: 12px; color: var(--ink-500); line-height: 1.8; }
 .missing-table .mt-preview { font-size: 11px; color: var(--ink-300); margin-top: 10px; font-family: var(--font-mono); }
 .missing-table .mt-actions { display: flex; align-items: center; gap: 10px; justify-content: center; margin-top: 14px; }
@@ -1577,11 +1577,11 @@ export default { name: 'SchemaDiffDialog' }
 .diff-cmp-pill.active { background: var(--mint-100); border-color: var(--mint-300); color: var(--mint-700); }
 /* pill 上跟随选中表的「该库自身差异」小徽章（配色与左栏 .diff-tbadge 一致） */
 .pill-part { font-size: 10px; font-weight: 800; padding: 0 5px; border-radius: 4px; line-height: 15px; flex: 0 0 auto; }
-.pill-part.add { background: #FDEBD9; color: #A76A12; }
-.pill-part.drop { background: #FFE4EC; color: #C2525F; }
-.pill-part.alt { background: #E3EEFB; color: #3E6DA8; }
-.pill-part.pk { background: #F1E7F7; color: #83539E; }
-.pill-part.missing { background: #F5E3E0; color: #A84A3F; }
+.pill-part.add { background: var(--tint-add-bg); color: var(--tint-add-ink); }
+.pill-part.drop { background: var(--tint-drop-bg); color: var(--tint-drop-ink); }
+.pill-part.alt { background: var(--tint-alt-bg); color: var(--tint-alt-ink); }
+.pill-part.pk { background: var(--tint-pk-bg); color: var(--tint-pk-ink); }
+.pill-part.missing { background: var(--tint-missing-bg); color: var(--tint-missing-ink); }
 .pill-part.ok { background: var(--mint-100); color: var(--mint-600); }
 .pill-label { font-size: 12px; color: var(--ink-500); font-weight: 700; }
 .d-only { margin-left: auto; }
@@ -1602,13 +1602,13 @@ export default { name: 'SchemaDiffDialog' }
 .meta-row { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; padding: 4px 0; }
 .meta-row + .meta-row { border-top: 1px solid var(--ink-100); }
 .meta-tag { flex: 0 0 auto; font-size: 10px; font-weight: 800; border-radius: var(--r-pill); padding: 1px 7px; background: var(--ink-100); color: var(--ink-700); }
-.meta-tag.tag-add { background: #FDE7E7; color: #B23B3B; }
+.meta-tag.tag-add { background: var(--pill-bad-bg); color: var(--danger-critical); }
 .meta-tag.tag-extra { background: var(--ink-100); color: var(--ink-500); }
-.meta-tag.tag-cmt { background: #FDF3D7; color: #8A6210; }
+.meta-tag.tag-cmt { background: var(--amber-soft-bg); color: var(--amber-ink2); }
 .meta-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-900); }
 .meta-cols { color: var(--ink-500); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .meta-note { margin-left: auto; font-size: 11px; color: var(--ink-300); }
-.missing-inline { color: #A84A3F; font-weight: 800; }
+.missing-inline { color: var(--tint-missing-ink); font-weight: 800; }
 .diff-actions-bar .btn.primary { margin-left: auto; }
 
 /* 一键确认（同步动作 · 逐列确认 总开关）：表头中间列纵向堆叠 + 胶囊勾选 */

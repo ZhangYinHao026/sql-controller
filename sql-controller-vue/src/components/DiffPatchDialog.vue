@@ -186,16 +186,16 @@ const ST = {
 .pd-lib-top { display: flex; align-items: center; gap: 6px; }
 .pd-lib-top .nm { font-size: 12.5px; font-weight: 800; color: var(--ink-700); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
 .role { font-size: 10px; font-weight: 800; border-radius: var(--r-pill); padding: 0 8px; line-height: 16px; flex: 0 0 auto; }
-.role-cmp { background: var(--cream-200); color: #8A6210; }
+.role-cmp { background: var(--cream-200); color: var(--amber-ink2); }
 .role-base { background: var(--ink-100); color: var(--ink-500); }
 .pd-lib-bot { display: flex; align-items: center; justify-content: space-between; }
 .pd-lib-bot .lines { font-size: 10.5px; color: var(--ink-300); font-family: var(--font-mono); }
 .st { font-size: 10.5px; font-weight: 800; border-radius: var(--r-pill); padding: 1px 8px; line-height: 16px; }
 .st.big { font-size: 11.5px; padding: 2px 12px; }
-.st-idle { background: #FFF3D6; color: #C77B00; }
-.st-run { background: #E3F0FF; color: #2E6FB7; animation: pd-pulse 1.2s ease-in-out infinite; }
-.st-done { background: #E4F4E8; color: #3E8E5A; }
-.st-fail { background: #FBE7E7; color: #C94F4F; }
+.st-idle { background: var(--amber-soft-bg); color: var(--amber-deep); }
+.st-run { background: var(--run-bg); color: var(--run-ink); animation: pd-pulse 1.2s ease-in-out infinite; }
+.st-done { background: var(--ok-bg); color: var(--ok-ink); }
+.st-fail { background: var(--pill-bad-bg); color: var(--danger-critical); }
 @keyframes pd-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
 .pd-empty { font-size: 12px; color: var(--ink-300); line-height: 1.9; padding: 18px 4px; }
 .pd-empty.big { text-align: center; padding: 60px 0; }
@@ -226,25 +226,25 @@ const ST = {
 .pd-view.pd-edit { border: 1px solid var(--mint-300); border-radius: var(--r-pill); padding: 2px 10px; color: var(--mint-700); }
 .pd-view.pd-edit:hover { background: var(--mint-100); }
 .pd-note { font-size: 11px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.pd-note .ok { color: #3E8E5A; font-weight: 800; }
-.pd-note .bad { color: #C94F4F; font-weight: 800; }
+.pd-note .ok { color: var(--ok-ink); font-weight: 800; }
+.pd-note .bad { color: var(--danger-critical); font-weight: 800; }
 /* 提示行里的可点击跳转（切到可编辑视图） */
 .pd-link { border: 0; background: transparent; padding: 0; cursor: pointer; font-size: 11px; font-weight: 800; color: var(--mint-700); text-decoration: underline; }
 .pd-link:hover { color: var(--mint-600); }
 /* 执行失败引导条 */
-.pd-fail-hint { background: #FDF3F3; border: 1px solid #F3D6D6; border-radius: 8px; padding: 6px 10px; }
+.pd-fail-hint { background: var(--danger-soft-bg); border: 1px solid var(--danger-soft-border); border-radius: 8px; padding: 6px 10px; }
 
 .patch-out {
   width: 100%; box-sizing: border-box; min-height: 44vh; resize: vertical;
   padding: 12px 14px; border: 1px solid var(--ink-200); border-radius: 10px;
-  background: linear-gradient(180deg, #FFFDF7, #FFF8E8);
+  background: linear-gradient(180deg, var(--grad-panel-a), var(--grad-panel-b));
   color: var(--ink-700); font: 12.5px/1.6 var(--font-mono); white-space: pre;
   outline: none;
 }
 .patch-out:focus { border-color: var(--mint-300); }
 .patch-out:disabled { opacity: .75; cursor: not-allowed; }
 /* 方言视图：只读，但**可点击**——点一下就切到可编辑的「源脚本」（浅底 + pointer 光标作提示） */
-.patch-out.view-only { background: #F5FAF8; cursor: pointer; }
+.patch-out.view-only { background: var(--patch-view-bg); cursor: pointer; }
 
 .pd-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .pd-warn { font-size: 11px; margin-left: auto; }

@@ -150,8 +150,10 @@ public class DmDialect extends AbstractDialect {
 
     @Override
     public String schemaAllTableCommentsQuery() {
-        return "SELECT table_name, comments FROM all_tab_comments WHERE owner = ? AND table_name IS NOT NULL "
-                + "ORDER BY table_name";
+        // 以 all_tables 为准（all_tab_comments 里含视图/索引等对象，直接拿来当表清单会混入脏数据）
+        return "SELECT t.table_name, c.comments FROM all_tables t "
+                + "LEFT JOIN all_tab_comments c ON c.owner = t.owner AND c.table_name = t.table_name "
+                + "WHERE t.owner = ? ORDER BY t.table_name";
     }
 
 }

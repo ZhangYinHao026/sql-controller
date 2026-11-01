@@ -25,21 +25,20 @@ let updating = false
 /* 语言扩展放 Compartment：初始用纯 MySQL 方言，schema 注入后用带 schema 的版本替换（避免重复注册 SQL 语言） */
 const schemaCompartment = new Compartment()
 
-/* ===== 奶油暖光主题（恢复历史样式） ===== */
+/* ===== 编辑器主题（颜色全部走 CSS 变量，切主题免重建编辑器） ===== */
 const editorTheme = EditorView.theme({
   '&': {
     height: '100%',
     fontSize: '13px',
-    /* 编辑区：自上而下奶油渐变（与原 #FFFDF7 → #FFF8E8 一致） */
-    background: 'linear-gradient(180deg, #FFFDF7 0%, #FFF8E8 100%)',
+    /* 编辑区：随主题的底色（亮=奶油渐变，暗=近黑） */
+    background: 'var(--grad-panel)',
     color: 'var(--ink-700)'
   },
   '.cm-scroller': {
     fontFamily: 'var(--font-mono)',
     lineHeight: '21px',
     overflow: 'auto',
-    /* 滚动区域沿用渐变，避免滚动时露出纯白底 */
-    background: 'linear-gradient(180deg, #FFFDF7 0%, #FFF8E8 100%)'
+    background: 'var(--grad-panel)'
   },
   '.cm-content': {
     minHeight: '100%',
@@ -49,8 +48,8 @@ const editorTheme = EditorView.theme({
   '.cm-line': { padding: '0 14px' },
   '&.cm-focused': { outline: 'none' },
   '.cm-gutters': {
-    /* 行号列：奶油色 #fff8e5 */
-    background: '#fff8e5',
+    /* 行号列：随主题底色 */
+    background: 'var(--icon-strip-bg)',
     color: 'var(--ink-300)',
     /* 去掉行号与编辑区之间的竖线 */
     borderRight: 'none',
@@ -63,17 +62,17 @@ const editorTheme = EditorView.theme({
     paddingLeft: '14px',
     paddingRight: '12px'
   },
-  '.cm-activeLine': { background: 'rgba(255, 233, 184, .25)' },
-  '.cm-activeLineGutter': { background: 'rgba(255, 233, 184, .55)', color: 'var(--ink-500)' },
+  '.cm-activeLine': { background: 'var(--cm-active-line)' },
+  '.cm-activeLineGutter': { background: 'var(--cm-active-gutter)', color: 'var(--ink-500)' },
   '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': {
-    background: 'rgba(209, 122, 63, .18) !important'
+    background: 'var(--cm-selection) !important'
   },
-  /* 联想下拉：奶油暖光风格（字体/圆角/配色均可在此改） */
+  /* 联想下拉：随主题风格 */
   '.cm-tooltip': {
     backgroundColor: 'var(--surface)',
     border: '1px solid var(--cream-200)',
     borderRadius: '12px',
-    boxShadow: '0 12px 32px rgba(95, 75, 60, .16)',
+    boxShadow: 'var(--cm-tip-shadow)',
     fontFamily: 'var(--font-sans)',
     fontSize: '13px',
     overflow: 'hidden'
@@ -94,8 +93,8 @@ const editorTheme = EditorView.theme({
     },
     '& ul li:hover': { background: 'var(--cream-50)' },
     '& ul li[aria-selected]': {
-      background: 'linear-gradient(135deg, var(--cream-100), #FFE9B8)',
-      color: '#8A5A1E',
+      background: 'var(--cm-tip-active-bg)',
+      color: 'var(--cm-tip-active-ink)',
       boxShadow: 'inset 0 0 0 1px var(--cream-200)'
     }
   },
@@ -114,29 +113,29 @@ const editorTheme = EditorView.theme({
     paddingLeft: '10px'
   },
   '.cm-completionMatchedText': {
-    color: '#D17A3F',
+    color: 'var(--sql-kw)',
     fontWeight: 700
   },
   /* {参数} 占位符底纹（paramDecoration 注入的 .cm-param） */
   '.cm-param': {
-    background: 'rgba(209, 122, 63, .16)',
+    background: 'var(--cm-param-bg)',
     borderRadius: '3px',
-    boxShadow: '0 0 0 1px rgba(209, 122, 63, .12)'
+    boxShadow: '0 0 0 1px var(--cm-param-border)'
   },
   '.cm-cursor': { borderLeftColor: 'var(--ink-900)' }
 })
 
-/* 语法高亮颜色（对齐原 .sql-keyword #D17A3F / string #4FA377 / number #B07AC9 / comment 灰） */
+/* 语法高亮（色值走 CSS 变量，对齐 .sql-keyword/.sql-string/.sql-number 全局 token） */
 const highlightStyle = HighlightStyle.define([
-  { tag: tags.keyword, color: '#D17A3F', fontWeight: 600 },
-  { tag: [tags.string, tags.special(tags.string)], color: '#4FA377' },
-  { tag: [tags.number, tags.integer, tags.float], color: '#B07AC9' },
+  { tag: tags.keyword, color: 'var(--sql-kw)', fontWeight: 600 },
+  { tag: [tags.string, tags.special(tags.string)], color: 'var(--sql-str)' },
+  { tag: [tags.number, tags.integer, tags.float], color: 'var(--sql-num)' },
   { tag: [tags.comment, tags.lineComment, tags.blockComment], color: 'var(--ink-300)', fontStyle: 'italic' },
-  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: '#8E24AA' },
+  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: 'var(--sql-fn)' },
   { tag: tags.variableName, color: 'var(--ink-900)' },
   { tag: [tags.operator, tags.punctuation], color: 'var(--ink-700)' },
-  { tag: [tags.bool, tags.null, tags.atom], color: '#B07AC9' },
-  { tag: tags.typeName, color: '#1E88E5' }
+  { tag: [tags.bool, tags.null, tags.atom], color: 'var(--sql-num)' },
+  { tag: tags.typeName, color: 'var(--sql-type)' }
 ])
 
 /* ===== 对外操作 ===== */

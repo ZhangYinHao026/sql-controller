@@ -1,11 +1,18 @@
 <script setup>
 import { computed, nextTick, ref } from 'vue'
 import CommandTreeNode from './CommandTreeNode.vue'
+import DbTreePanel from './db/DbTreePanel.vue'
 
-const props = defineProps({ nodes: { type: Array, default: () => [] }, loading: Boolean })
-const emit = defineEmits(['create', 'update', 'remove', 'send', 'reload', 'error', 'convert'])
+const props = defineProps({
+  nodes: { type: Array, default: () => [] },
+  loading: Boolean,
+  /** 当前主题，决定左下角主题按钮显示月亮还是太阳 */
+  theme: { type: String, default: 'mint' }
+})
+const emit = defineEmits(['create', 'update', 'remove', 'send', 'reload', 'error', 'convert', 'theme', 'history', 'diff', 'settings'])
 const collapsed = ref(false)
-const activeMenu = ref('script')
+/* 默认展开「表浏览」，脚本树等用户点 ⌘ 再去拉 */
+const activeMenu = ref('db')
 const width = ref(300)
 const selectedId = ref(null)
 const nameInput = ref(null)
@@ -16,6 +23,7 @@ const paramValues = ref({})
 const rootNodes = computed(() => props.nodes.filter(node => node.parentId == null))
 const folders = computed(() => props.nodes.filter(node => node.nodeType === 'folder'))
 const contextParent = ref(null)
+const panelTitle = computed(() => ({script: 'SQL 脚本', db: '表浏览', convert: 'SQL 转换'}[activeMenu.value] || 'SQL 脚本'))
 
 function scriptParameters(text = '') {
   const seen = new Set()
@@ -206,14 +214,23 @@ function startResize(event) {
 </script>
 
 <template>
-  <aside class="command-shell" :class="{ collapsed }" :style="{ width: `${width}px` }">
+  <aside class="command-shell" :class="{ collapsed }" :style="collapsed ? { width: '46px' } : { width: `${width}px` }">
     <div class="command-icon-strip">
-      <button class="command-icon" :class="{ active: activeMenu === 'script' }" title="SQL 脚本" @click="toggleMenu('script')">⌘</button>
-      <button class="command-icon" title="SQL 转换" @click="toggleConvert">⇄</button>
+      <button class="command-icon db" :class="{ active: activeMenu === 'db' }" title="表浏览" @click="toggleMenu('db')">▦</button>
+      <button class="command-icon script" :class="{ active: activeMenu === 'script' }" title="SQL 脚本" @click="toggleMenu('script')">⌘</button>
+      <button class="command-icon convert" title="SQL 转换" @click="toggleConvert">⇄</button>
+      <!-- 原顶栏的四个入口：沉到最底部，标题栏因此可以整条去掉 -->
+      <div class="icon-strip-space"></div>
+      <div class="icon-strip-sep"></div>
+      <button class="command-icon glyph" title="历史记录" @click="emit('history')">🕘</button>
+      <button class="command-icon glyph" title="字段对比" @click="emit('diff')">⇆</button>
+      <button class="command-icon glyph" title="设置" @click="emit('settings')">⚙</button>
+      <button class="command-icon glyph" type="button" :title="theme === 'supabase' ? '切回薄荷亮色' : '切换 Supabase 暗色'"
+              aria-label="主题切换" @click="emit('theme')">{{ theme === 'supabase' ? '☀️' : '🌙' }}</button>
     </div>
     <div v-if="!collapsed" class="command-panel">
       <header class="command-panel-head">
-        <strong>{{ activeMenu === 'script' ? 'SQL 脚本' : 'SQL 转换' }}</strong>
+        <strong>{{ panelTitle }}</strong>
         <button class="plain-icon" title="收起" @click="collapsed = true">‹</button>
       </header>
       <div v-if="activeMenu === 'script'" class="command-tree" @click.self="selectedId = null" @contextmenu.self.prevent="showContext(null, $event)">
@@ -224,6 +241,7 @@ function startResize(event) {
         </template>
         <div v-else class="command-empty">右键此处可新建文件夹或命令</div>
       </div>
+      <DbTreePanel v-else-if="activeMenu === 'db'" />
       <div v-else class="command-empty">SQL 转换功能准备中</div>
       <section v-if="draft && activeMenu === 'script'" class="command-editor">
         <div class="command-editor-head">

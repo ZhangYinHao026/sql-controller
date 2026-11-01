@@ -35,6 +35,15 @@ public class MySqlDialect extends AbstractDialect {
         return Collections.emptyList();
     }
 
+    /** MySQL 用反引号；库名/表名/列名里的反引号需成对转义。 */
+    @Override
+    public String quoteAlways(String identifier) {
+        if (identifier == null) {
+            return null;
+        }
+        return "`" + identifier.replace("`", "``") + "`";
+    }
+
     /** 字段对比快照批量列查询：一条拉全库列（含主键/自增/注释/可空/默认值），服务端按 table_name 分组。 */
     @Override
     public String schemaAllColumnsQuery() {

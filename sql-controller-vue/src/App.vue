@@ -1,5 +1,5 @@
 <script setup>
-import {computed, onMounted, reactive, ref} from 'vue'
+import {computed, onMounted, reactive, ref, watch} from 'vue'
 import {api} from './api'
 import SqlEditor from './components/SqlEditor.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
@@ -11,10 +11,22 @@ import CommandSidebar from './components/CommandSidebar.vue'
 import { DB_REGISTRY, typeLabel } from './utils/dbRegistry'
 import { assembleStatements } from './utils/sqlStatements'
 import { onlineSqlInfo } from './utils/onlineSql'
+import { currentTheme, toggleTheme } from './utils/theme'
 import ConvertDialog from './components/ConvertDialog.vue'
 import SchemaDiffDialog from './components/SchemaDiffDialog.vue'
+import TabStrip from './components/db/TabStrip.vue'
+import TableWorkspace from './components/db/TableWorkspace.vue'
+import { activeTable, hasTableTabs, tableTabs, SQL_TAB_KEY } from './state/tableTabs'
+import { pendingSql } from './state/sqlBridge'
 
 const sql = ref('')
+/* 表树「生成 SELECT」：写入编辑器并切回 SQL 工作台（表 Tab 仍保留，可再点回去） */
+watch(pendingSql, value => {
+  if (!value) return
+  sql.value = value.text
+  tableTabs.activeKey = SQL_TAB_KEY
+  pendingSql.value = null
+})
 const dbTypes = ref([]), connections = ref([]), selectedType = ref('mysql'), selectedIds = ref([])
 /* 环境：local=本地 JDBC 直连；online=线上（查询经远程小助手只读，修改经各省 updateSql）。
  * 两套连接 ID 空间独立，线上统一以 online:<id> 语义区分（接口层各走各的端点，不会混用）。 */
@@ -50,8 +62,7 @@ const selectedConnections = computed(() => connections.value.filter(item => sele
 /* 线上区域（启用中的），与本地 currentConnections 平行 */
 const currentOnlineConnections = computed(() => onlineConnections.value.filter(item => item.enabled !== false))
 const selectedOnlineConnections = computed(() => currentOnlineConnections.value.filter(item => onlineSelectedIds.value.includes(item.id)))
-/* 编辑器内容的线上执行意图（只读 / 写入 / 不合法），用于路由提示 */
-const onlineRoute = computed(() => env.value === 'online' ? onlineSqlInfo(sql.value) : null)
+/* 编辑器内容的线上执行意图在 startExecuteOnline 里现算，不再常驻提示 */
 const metrics = computed(() => results.value.length ? `${results.value.filter(x => x.status === 'SUCCESS').length}/${results.value.length} 个数据库成功` : '尚未执行 SQL')
 const totalRows = computed(() => Math.max(0, ...results.value.map(item => Number(item.total || 0))))
 const totalPages = computed(() => pagination.value ? Math.max(1, Math.ceil(totalRows.value / Math.max(1, Number(pageSize.value) || 1))) : 1)
@@ -929,21 +940,14 @@ onMounted(async () => {
 </script>
 
 <template>
-  <header class="topbar">
-    <div class="topbar-brand">
-      <img class="brand-mark" src="/icon/tabIcon.jpg" alt="" aria-hidden="true">
-      <h1 class="topbar-title">SQL 工作台</h1>
-    </div>
-    <nav class="topbar-nav">
-      <button class="theme-btn" type="button" title="主题切换（敬请期待）" aria-label="主题切换">🌙</button>
-      <button class="nav-btn" @click="openHistory">📜 历史记录</button>
-      <button class="nav-btn" @click="openDiff()">⇆ 字段对比</button>
-      <button class="nav-btn" @click="openSettings">⚙ 设置</button>
-    </nav>
-  </header>
+  <!-- 无标题栏：全局入口（主题/历史/字段对比/设置）挪到左侧图标栏底部，整页再上移 60px -->
   <main class="workspace">
-    <CommandSidebar :nodes="nodes" :loading="nodesLoading" @reload="loadNodes" @create="createNode" @update="updateNode" @remove="removeNode" @send="sendCommand" @error="toast" @convert="dialogs.convert = true" />
+    <CommandSidebar :nodes="nodes" :loading="nodesLoading" :theme="currentTheme" @reload="loadNodes" @create="createNode" @update="updateNode" @remove="removeNode" @send="sendCommand" @error="toast" @convert="dialogs.convert = true"
+                    @theme="toggleTheme" @history="openHistory" @diff="openDiff()" @settings="openSettings" />
     <div class="container workspace-content">
+    <!-- 布局 A：表视图与 SQL 编辑器同级。Tab 条只在有表打开时出现；SQL 工作台用 v-show 保活（不丢结果与滚动位置） -->
+    <TabStrip v-if="hasTableTabs" />
+    <div class="sql-workspace" v-show="!activeTable">
     <section class="card selector">
       <div class="selector-row"><span class="label">环境</span>
         <div class="env-switch">
@@ -951,8 +955,6 @@ onMounted(async () => {
           <button type="button" class="env-btn" :class="{ on: env === 'online', online: env === 'online' }"
                   @click="switchEnv('online')">线上 · 生产</button>
         </div>
-        <span v-if="env === 'online'" class="env-note">只读查询经远程小助手 · 修改走写入接口（updateSql）</span>
-        <span v-else class="note">本地 JDBC 直连（MySQL / 达梦 / 神通）</span>
       </div>
       <div v-if="env === 'local'" class="selector-row"><span class="label">数据库类型</span>
         <div class="choices">
@@ -970,8 +972,7 @@ onMounted(async () => {
                   :class="{ active: selectedIds.includes(item.id) }" @click="toggleConnection(item.id)">
             {{ item.regionName }}
           </button>
-          <span v-if="!currentConnections.length" class="muted">暂无该类型连接，请在设置中新增</span></div>
-        <span class="note">可多选，同一 SQL 将在每个选中数据库中执行</span></div>
+          <span v-if="!currentConnections.length" class="muted">暂无该类型连接，请在设置中新增</span></div></div>
       <div v-else class="selector-row"><span class="label">区域</span>
         <div class="choices">
           <button v-if="currentOnlineConnections.length >= 2" class="choice select-all"
@@ -984,18 +985,9 @@ onMounted(async () => {
           <span v-if="!currentOnlineConnections.length" class="muted">
             暂无线上区域，请到「设置 → 线上环境」点「⟳ 导入 java 区域」</span>
         </div>
-        <span class="note">可多选（每区域各发一次请求并行执行）· 只读查询 · 末尾分号自动去除</span></div>
+      </div>
     </section>
     <SqlEditor v-model="sql" v-model:transactional="transactional" @execute="startExecute"/>
-    <div v-if="env === 'online' && onlineRoute" class="route-hint">
-      <span class="pill" :class="onlineRoute.error ? 'bad' : (onlineRoute.readOnly ? 'read' : 'write')">
-        {{ onlineRoute.error ? '无法执行' : (onlineRoute.readOnly ? '远程查询小助手 · 只读' : '写入接口 · 需确认') }}
-      </span>
-      <span v-if="onlineRoute.error">{{ onlineRoute.error }}</span>
-      <span v-else-if="onlineRoute.hasTrailingSemicolon">检测到末尾分号，执行时会自动去掉</span>
-      <span v-else-if="!onlineRoute.readOnly">修改语句：只能选 1 个区域，执行前会二次确认</span>
-      <span v-else>将按选中区域并行查询，每个区域一张结果卡</span>
-    </div>
     <section class="card result">
       <div class="result-head">
         <div class="tabs">
@@ -1073,6 +1065,8 @@ onMounted(async () => {
       </div>
       <div v-else class="error-box" :class="{ visible: error }">{{ error || '暂无错误信息' }}</div>
     </section>
+    </div>
+    <TableWorkspace v-if="activeTable" :key="activeTable.key" :tab="activeTable" />
     </div>
   </main>
   <ConfirmDialog :show="confirm.show" :sql="confirm.sql" :targets="confirm.targets" :warnings="confirm.warnings" @confirm="confirmExecute"

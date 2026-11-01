@@ -19,6 +19,24 @@ public class SqlControllerProperties {
     private int maxPageSize = 100;
     /** 未传分页参数时使用的默认页大小。 */
     private int defaultPageSize = 10;
+    /** 表浏览写入口开关（行级增删改 / 执行 DDL）。 */
+    private Write write = new Write();
+
+    /** 写入口配置：默认全关——本工具没有登录鉴权，默认不允许「点一下就改库」。 */
+    public static class Write {
+        /** 本地直连库：单元格编辑 / 提交变更 / 执行 DDL。 */
+        private boolean enabled = false;
+        /** 线上（生产）区域：同一套写入口是否可用。 */
+        private boolean onlineEnabled = false;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public boolean isOnlineEnabled() { return onlineEnabled; }
+        public void setOnlineEnabled(boolean onlineEnabled) { this.onlineEnabled = onlineEnabled; }
+    }
+
+    public Write getWrite() { return write; }
+    public void setWrite(Write write) { this.write = write; }
 
     public int getExecutionTimeoutSeconds() { return executionTimeoutSeconds; }
     public void setExecutionTimeoutSeconds(int executionTimeoutSeconds) { this.executionTimeoutSeconds = executionTimeoutSeconds; }

@@ -69,10 +69,10 @@ function toggle(kind, e) {
 .diff-cell { padding: 7px 12px; font-size: 12px; min-height: 38px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; color: var(--ink-700); }
 .diff-cell + .diff-cell { border-left: 1px solid var(--ink-100); }
 .diff-row.same { background: var(--mint-50); }
-.diff-row.add { background: #FFFBF2; }
-.diff-row.drop { background: #FFF5F6; }
-.diff-row.alt { background: #F5F9FF; }
-.diff-row.pk { background: #FBF6FE; }
+.diff-row.add { background: var(--row-add-bg); }
+.diff-row.drop { background: var(--row-drop-bg); }
+.diff-row.alt { background: var(--row-alt-bg); }
+.diff-row.pk { background: var(--row-pk-bg); }
 .diff-fname { font-weight: 800; color: var(--ink-900); font-family: var(--font-mono); font-size: 12.5px; }
 .diff-fmeta { font-size: 11px; color: var(--ink-500); }
 .diff-fmeta .pk-tag { color: var(--mint-600); font-weight: 800; }
@@ -81,12 +81,12 @@ function toggle(kind, e) {
 .diff-mid { display: flex; flex-direction: column; justify-content: center; align-items: stretch; gap: 6px; padding: 6px 10px; }
 .mid-kind { font-size: 11px; font-weight: 800; border-radius: var(--r-pill); padding: 2px 10px; text-align: center; }
 .mid-kind.ok { background: var(--mint-100); color: var(--mint-700); }
-.mid-kind.add { background: #FDEBD9; color: #A76A12; }
-.mid-kind.drop { background: #FFE4EC; color: #C2525F; }
-.mid-kind.alt { background: #E3EEFB; color: #3E6DA8; }
-.mid-kind.pk { background: #F1E7F7; color: #83539E; }
+.mid-kind.add { background: var(--tint-add-bg); color: var(--tint-add-ink); }
+.mid-kind.drop { background: var(--tint-drop-bg); color: var(--tint-drop-ink); }
+.mid-kind.alt { background: var(--tint-alt-bg); color: var(--tint-alt-ink); }
+.mid-kind.pk { background: var(--tint-pk-bg); color: var(--tint-pk-ink); }
 .mid-reason { font-size: 10.5px; color: var(--ink-500); line-height: 1.5; }
 .diff-colchk { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink-700); cursor: pointer; user-select: none; }
 .diff-colchk input { accent-color: var(--mint-500); margin: 0; }
-.diff-colchk.danger { color: #C2525F; font-weight: 700; }
+.diff-colchk.danger { color: var(--tint-drop-ink); font-weight: 700; }
 </style>

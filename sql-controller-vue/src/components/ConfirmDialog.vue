@@ -26,7 +26,7 @@ defineEmits(['confirm', 'cancel'])
         <div class="warn-title">⚠ 转换告警：以下 {{ warnings.length }} 条语句转换时被跳过，未包含在待执行脚本中</div>
         <ul><li v-for="(w, i) in warnings" :key="i">{{ w }}</li></ul>
       </div>
-      <div v-if="mode === 'sql'" class="sql-preview">目标：{{ targets.map(item => item.regionName).join('、') }}\n\n{{ sql }}</div>
+      <div v-if="mode === 'sql'" class="sql-preview">目标：{{ targets.map(item => item.regionName).join('、') }}{{ '\n\n' }}{{ sql }}</div>
       <div class="modal-actions">
         <button class="btn" @click="$emit('cancel')">{{ cancelText }}</button>
         <button :class="danger ? 'btn danger' : 'btn primary'" @click="$emit('confirm')">{{ confirmText || (mode === 'sql' ? '确认执行' : '确认') }}</button>

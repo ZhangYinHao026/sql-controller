@@ -27,6 +27,21 @@ public class AutocompleteProperties {
     /** 单表字段数量上限。 */
     private int maxColumns = 100;
 
+    /**
+     * 表浏览「单表结构」缓存 TTL（秒）。
+     *
+     * <p>负数 = 永不过期（默认：查一次管到服务重启，靠右键「刷新表结构 / 重拉整库结构」手动刷新）；
+     * 0 = 关闭缓存（每次真查）；正数 = 到期自动重查。
+     *
+     * <p>为什么默认不过期：表浏览的读操作（翻页/排序/筛选/导出）都发生在几十秒内，
+     * 而结构变更本身极低频；TTL 到点造成的「莫名变慢」比这点陈旧更难解释。
+     * 写操作（改数据/改结构）不走这层缓存，永远真查，所以不存在「外部加字段后永久写不进去」的风险。
+     */
+    private long tableCacheSeconds = -1;
+
+    /** 单表结构缓存条数上限（全局）。超过后按写入顺序淘汰最旧的，防止长期运行内存无界增长。 */
+    private int tableCacheMaxEntries = 2000;
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -65,5 +80,21 @@ public class AutocompleteProperties {
 
     public void setMaxColumns(int maxColumns) {
         this.maxColumns = maxColumns;
+    }
+
+    public long getTableCacheSeconds() {
+        return tableCacheSeconds;
+    }
+
+    public void setTableCacheSeconds(long tableCacheSeconds) {
+        this.tableCacheSeconds = tableCacheSeconds;
+    }
+
+    public int getTableCacheMaxEntries() {
+        return tableCacheMaxEntries;
+    }
+
+    public void setTableCacheMaxEntries(int tableCacheMaxEntries) {
+        this.tableCacheMaxEntries = tableCacheMaxEntries;
     }
 }

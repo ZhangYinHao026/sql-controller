@@ -24,6 +24,23 @@ public interface Dialect {
     /** 保留字加引号，普通标识符原样返回。 */
     String quote(String identifier);
 
+    /**
+     * 无条件加引号的标识符（表浏览 / 行级 CRUD 拼 SQL 用）。
+     *
+     * <p>与 {@link #quote(String)} 的区别：这里一律加引号且不做保留字判断，保证
+     * 「列名 = 关键字、列名含空格、达梦/神通大小写敏感」等场景不会拼出歧义 SQL。
+     * 大小写不折叠——名字直接取自结构快照，即库内真实大小写。
+     */
+    String quoteAlways(String identifier);
+
+    /**
+     * 原生表 DDL 查询（参数：schema 名、表名），返回 null 表示方言不支持、由服务端按结构拼装。
+     * MySQL 走 {@code SHOW CREATE TABLE}，不需要本方法。
+     */
+    default String tableDdlQuery() {
+        return null;
+    }
+
     /** AUTO_INCREMENT 对应的本方言自增子句，如 IDENTITY(1,1)（仅 pseudoTypeIdentity()==false 时使用）。 */
     String identityClause();
 

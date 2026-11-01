@@ -147,8 +147,10 @@ public class OscarDialect extends AbstractDialect {
 
     @Override
     public String schemaAllTableCommentsQuery() {
-        return "SELECT table_name, comments FROM all_tab_comments WHERE owner = ? AND table_name IS NOT NULL "
-                + "ORDER BY table_name";
+        // 神通（PG 内核）的 all_tab_comments 会把索引也列进来（xxx_PK / xxx_IDX），必须从 all_tables 出发
+        return "SELECT t.table_name, c.comments FROM all_tables t "
+                + "LEFT JOIN all_tab_comments c ON c.owner = t.owner AND c.table_name = t.table_name "
+                + "WHERE t.owner = ? ORDER BY t.table_name";
     }
 
     /**

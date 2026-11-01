@@ -148,7 +148,7 @@ const filtered = computed(() => {
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(255, 255, 255, .55);
+  background: var(--editor-tint);
   color: var(--ink-500);
   font-size: 13px;
   font-weight: 600;
@@ -205,8 +205,8 @@ const filtered = computed(() => {
   overflow: hidden;
   margin-top: 4px;
   font-size: 11.5px;
-  color: #B95A5A;
-  background: #FFF5F5;
+  color: var(--danger-ink);
+  background: var(--danger-soft-bg);
   padding: 6px 10px;
   border-radius: var(--r-xs);
   border-left: 3px solid var(--danger);

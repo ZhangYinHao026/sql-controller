@@ -20,6 +20,11 @@ sql-controller:
   max-page-size: 100
   default-page-size: 10
   cors-origins: "*"
+  # 表浏览写入口：默认全关——本工具没有登录鉴权，默认不允许「点单元格就改库」。
+  # 需要改数据/改结构时显式置 true 并重启；关闭时后端直接拒绝 /api/db/rows/* 与 /api/db/ddl/execute。
+  write:
+    enabled: ${SQL_CONTROLLER_WRITE_ENABLED:false}
+    online-enabled: ${SQL_CONTROLLER_WRITE_ONLINE_ENABLED:false}
   # SQL 编辑器联想数据源配置
   autocomplete:
     enabled: true
@@ -27,6 +32,12 @@ sql-controller:
     schema-cache-seconds: 86400    # 结构元数据缓存 TTL：24h（联想 + 字段对比快照共用，可「强制重抓」绕过）
     max-tables: 500               # 表数量上限
     max-columns: 100               # 单表字段上限
+    # 表浏览「单表结构」缓存：读路径命中即返回，写路径（改数据/改结构）永远真查，不受此配置影响。
+    #   -1 = 永不过期（默认）：查一次管到重启，靠右键「刷新表结构 / 重拉整库结构」手动失效
+    #    0 = 关闭缓存：每次真查（回到旧行为，出问题可一键回退）
+    #   >0 = 到期自动重查（秒）
+    table-cache-seconds: -1
+    table-cache-max-entries: 2000  # 缓存条数上限（全局），超出按写入顺序淘汰最旧
   # 线上环境：查询经内网「远程查询小助手」只读代理，修改经各省 sxwh-allowance 的 updateSql 接口。
   # 说明：小助手地址全局固定，区域差异只体现在 area 参数（每个区域各配一条 online_connection 记录）。
   online:

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { ref, watch } from 'vue'
 import { typeLabel } from '../utils/dbRegistry'
 
 const props = defineProps({
@@ -29,13 +29,6 @@ function onlineState(row) {
     : { text: '可查（写入未启用）', cls: 'warn' }
 }
 
-/** 加密方式中文名（remote=中心加密接口，local=本地密钥，auto=远程优先+本地回落）。 */
-const encryptLabel = computed(() => {
-  const v = props.onlineStatus?.encryptMode
-  if (v === 'local') return '本地 SM4 加密'
-  if (v === 'auto') return '中心加密（失败回落本地）'
-  return '中心加密接口'
-})
 </script>
 
 <template>
@@ -56,13 +49,6 @@ const encryptLabel = computed(() => {
     </template>
 
     <template v-else>
-      <div class="online-info">
-        <span class="oi-item"><b>查询通道</b> {{ onlineStatus?.baseUrl || 'http://192.168.0.2:808' }}/LocalTest/ToSel · 只读 · 不支持分号/多语句（分号会自动去除）</span>
-        <span class="oi-item"><b>写入通道</b>
-          <span :class="onlineStatus?.writeEnabled ? 'ok' : 'warn'">{{ onlineStatus?.writeEnabled ? `已启用（${onlineStatus?.writePath || '/api/sxwh/updateSql'} · ${encryptLabel}）` : '未配置加密方式，仅可查询' }}</span>
-        </span>
-        <span class="oi-item"><b>加密通道</b> {{ onlineStatus?.encryptUrl || '（未配置中心加密接口）' }} · 先取加密串再写目标省份</span>
-      </div>
       <div class="setting-tools">
         <input v-model="onlineKeyword" class="input search" placeholder="搜索区域 / 区域码" />
         <button class="btn" title="从 pageConfig.json 拉取全部 java 区域（已存在的跳过）" @click="$emit('online-import')">⟳ 导入 java 区域</button>

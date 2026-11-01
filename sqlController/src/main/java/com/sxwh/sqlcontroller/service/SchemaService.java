@@ -24,12 +24,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SQL 编辑器联想数据源服务。
@@ -56,6 +58,26 @@ public class SchemaService {
 
     /** 字段对比快照缓存：connectionId → (快照, 过期时间)，独立于联想缓存（不同 TTL 语义/数据源）。 */
     private final Map<Long, SnapshotEntry> snapshotCache = new ConcurrentHashMap<>();
+
+    /**
+     * 表浏览「单表结构」缓存：{@code connectionId:表名} → (结构, 过期时间)。
+     *
+     * <p>为什么单独一层：整库快照的 filtered 分支（只查指定表）故意不读也不写缓存，
+     * 用来保证「打完补丁立刻看到新结构」；表浏览要的是「查一次管很久」，语义不同，不能共用。
+     * TTL 见 {@link AutocompleteProperties#getTableCacheSeconds()}（默认 -1 = 永不过期，靠手动刷新）。
+     */
+    private final Map<String, TableEntry> tableCache = new ConcurrentHashMap<>();
+
+    /**
+     * 同一张表的并发查询合并（single-flight）。
+     *
+     * <p>打开一张表时前端会同时请求「结构」和「数据」，两个请求都要拿这张表的结构；
+     * 没有这层合并的话，缓存冷启动时两个请求会各自跑一遍全库字典查询——恰好把要省的开销翻倍。
+     */
+    private final Map<String, CompletableFuture<TableInfo>> tableLoading = new ConcurrentHashMap<>();
+
+    /** 表缓存写入序号：超容量时按它淘汰最旧的条目。 */
+    private final AtomicLong tableCacheSeq = new AtomicLong();
 
     /**
      * 抓快照专用线程池：固定大小 8，避免单次 batch 把 10 库全推到同瞬间连 DB。
@@ -114,6 +136,232 @@ public class SchemaService {
             log.warn("[SchemaService] 读取元数据失败 connectionId={}: {}", cid, e.getMessage());
             return SchemaResponse.disabled("读取元数据失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 只清联想缓存（编辑器自动补全用）。执行 DDL 后要调：加了字段，编辑器联想得能立刻看到。
+     */
+    public void evictAutocomplete(Long connectionId) {
+        if (connectionId != null) {
+            cache.remove(connectionId);
+        }
+    }
+
+    /**
+     * 清掉某个连接的全部单表结构缓存（「重拉整库结构」）。
+     */
+    public void evictTables(Long connectionId) {
+        if (connectionId == null) {
+            return;
+        }
+        tableCache.entrySet().removeIf(entry -> connectionId.equals(entry.getValue().connectionId));
+    }
+
+    /**
+     * 精确清一张表的结构缓存（表级「刷新表结构」/ 本工具执行 DDL 成功后）。
+     *
+     * <p>先按 {connectionId:表名} 精确命中；未命中再按连接内大小写不敏感兜底
+     * （前端传来的可能是用户输入的大小写，与快照里的真实表名不同）。
+     */
+    public void evictTable(Long connectionId, String table) {
+        if (connectionId == null || table == null || table.trim().isEmpty()) {
+            return;
+        }
+        String name = table.trim();
+        if (tableCache.remove(tableKey(connectionId, name)) != null) {
+            log.info("[SchemaService] evict table connectionId={} table={}", connectionId, name);
+            return;
+        }
+        for (Map.Entry<String, TableEntry> entry : tableCache.entrySet()) {
+            TableEntry value = entry.getValue();
+            if (connectionId.equals(value.connectionId) && value.table.equalsIgnoreCase(name)) {
+                tableCache.remove(entry.getKey());
+                log.info("[SchemaService] evict table connectionId={} table={} (matched {})",
+                        connectionId, name, value.table);
+                return;
+            }
+        }
+    }
+
+    /**
+     * 整库缓存清理：联想 + 该连接全部单表结构缓存。
+     */
+    public void evict(Long connectionId) {
+        evictAutocomplete(connectionId);
+        evictTables(connectionId);
+    }
+
+    // ==================== 表浏览：单表结构（带缓存） ====================
+
+    /** 读路径取单表结构：命中缓存直接返回。 */
+    public TableInfo table(Long connectionId, String table) {
+        return table(connectionId, table, false);
+    }
+
+    /**
+     * 取单表结构：命中缓存即返回；未命中只查这一张表并回填缓存。
+     *
+     * <p>写路径（改数据 / 改结构 / 白名单校验）必须传 {@code force=true} 绕过缓存：
+     * 结构缓存不过期的情况下，外部加的字段如果只活在这里，会让写入永远报「未知列」。
+     *
+     * @param force true = 跳过缓存强制重查（拿到结果后仍会回填缓存）
+     */
+    public TableInfo table(Long connectionId, String table, boolean force) {
+        String name = requireTableName(table);
+        if (connectionId == null) {
+            throw new IllegalArgumentException("连接 id 为空");
+        }
+        if (!force) {
+            TableInfo cached = cachedTable(connectionId, name);
+            if (cached != null) {
+                log.debug("[SchemaService] table cache hit connectionId={} table={}", connectionId, cached.getName());
+                return cached;
+            }
+        }
+        if (props.getTableCacheSeconds() == 0) {
+            // 缓存已关闭：直接查，不合并并发（保持「每次真查」的语义）
+            return loadTable(connectionId, name);
+        }
+        String key = tableKey(connectionId, name);
+        CompletableFuture<TableInfo> mine = new CompletableFuture<>();
+        CompletableFuture<TableInfo> running = tableLoading.putIfAbsent(key, mine);
+        if (running != null) {
+            log.debug("[SchemaService] table load merged connectionId={} table={}", connectionId, name);
+            return awaitTable(running);
+        }
+        try {
+            TableInfo info = loadTable(connectionId, name);
+            rememberTable(key, connectionId, info);
+            mine.complete(info);
+            return info;
+        } catch (RuntimeException e) {
+            // 失败不写缓存：刚建好的表要能立刻打开
+            mine.completeExceptionally(e);
+            throw e;
+        } finally {
+            tableLoading.remove(key, mine);
+        }
+    }
+
+    /** 查库拿单表结构（表不存在 / 快照失败都抛异常，不进缓存）。 */
+    private TableInfo loadTable(Long connectionId, String name) {
+        SchemaSnapshot snapshot = snapshot(connectionId, true, Collections.singletonList(name));
+        if (!snapshot.isOk()) {
+            throw new IllegalStateException("读取表结构失败: " + snapshot.getError());
+        }
+        for (TableInfo info : snapshot.getTables()) {
+            if (info.getName().equalsIgnoreCase(name)) {
+                return info;
+            }
+        }
+        throw new IllegalArgumentException("表不存在或无权访问: " + name);
+    }
+
+    private TableInfo cachedTable(Long connectionId, String name) {
+        TableEntry exact = tableCache.get(tableKey(connectionId, name));
+        if (isFresh(exact)) {
+            return exact.data;
+        }
+        // 真实表名大小写可能不同（达梦/神通折叠成大写、MySQL 在 Linux 上区分大小写）。
+        // 只在精确未命中时才做不敏感匹配：同一个库里「仅大小写不同」的两张表仍能精确区分。
+        for (TableEntry entry : tableCache.values()) {
+            if (connectionId.equals(entry.connectionId) && entry.table.equalsIgnoreCase(name) && isFresh(entry)) {
+                return entry.data;
+            }
+        }
+        return null;
+    }
+
+    private boolean isFresh(TableEntry entry) {
+        if (entry == null) {
+            return false;
+        }
+        if (props.getTableCacheSeconds() == 0) {
+            return false;
+        }
+        return entry.expireAt < 0 || System.currentTimeMillis() <= entry.expireAt;
+    }
+
+    private void rememberTable(String key, Long connectionId, TableInfo info) {
+        long ttl = props.getTableCacheSeconds();
+        if (ttl == 0) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long expireAt = ttl < 0 ? -1L : now + ttl * 1000L;
+        tableCache.put(key, new TableEntry(connectionId, info.getName(), info, expireAt, now,
+                tableCacheSeq.incrementAndGet()));
+        trimTableCache();
+    }
+
+    /**
+     * 这份结构的抓取时间（毫秒），未命中缓存返回 null。
+     *
+     * <p>给前端显示「缓存于 3 天前」用：永久缓存下用户必须能看见结构有多旧，才知道要不要右键刷新。
+     */
+    public Long tableCacheCapturedAt(Long connectionId, String table) {
+        if (connectionId == null || table == null || table.trim().isEmpty()) {
+            return null;
+        }
+        String name = table.trim();
+        TableEntry exact = tableCache.get(tableKey(connectionId, name));
+        if (isFresh(exact)) {
+            return exact.capturedAt;
+        }
+        for (TableEntry entry : tableCache.values()) {
+            if (connectionId.equals(entry.connectionId) && entry.table.equalsIgnoreCase(name) && isFresh(entry)) {
+                return entry.capturedAt;
+            }
+        }
+        return null;
+    }
+
+    /** 容量保护：超过上限时按写入顺序淘汰最旧的。只在超限时扫描（2000 条量级，成本可忽略）。 */
+    private void trimTableCache() {
+        int max = Math.max(1, props.getTableCacheMaxEntries());
+        while (tableCache.size() > max) {
+            String oldestKey = null;
+            long oldestSeq = Long.MAX_VALUE;
+            for (Map.Entry<String, TableEntry> entry : tableCache.entrySet()) {
+                if (entry.getValue().seq < oldestSeq) {
+                    oldestSeq = entry.getValue().seq;
+                    oldestKey = entry.getKey();
+                }
+            }
+            if (oldestKey == null || tableCache.remove(oldestKey) == null) {
+                return;
+            }
+            log.debug("[SchemaService] table cache evicted by capacity key={}", oldestKey);
+        }
+    }
+
+    private TableInfo awaitTable(CompletableFuture<TableInfo> future) {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw e;
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("表结构查询被中断: " + e.getMessage(), e);
+        }
+    }
+
+    private String tableKey(Long connectionId, String table) {
+        return connectionId + ":" + table;
+    }
+
+    private String requireTableName(String table) {
+        if (table == null || table.trim().isEmpty()) {
+            throw new IllegalArgumentException("表名不能为空");
+        }
+        String name = table.trim();
+        if (isSystemTable(name)) {
+            throw new IllegalArgumentException("不允许浏览系统表: " + name);
+        }
+        return name;
     }
 
     /**
@@ -993,6 +1241,27 @@ public class SchemaService {
 
         boolean isExpired() {
             return System.currentTimeMillis() > expireAt;
+        }
+    }
+
+    /** 单表结构缓存条目：expireAt < 0 表示永不过期（默认策略）。 */
+    private static class TableEntry {
+        final Long connectionId;
+        /** 库内真实表名（用户传的名字可能大小写不同）。 */
+        final String table;
+        final TableInfo data;
+        final long expireAt;
+        /** 抓取时间（展示「结构缓存于 xx」用）。 */
+        final long capturedAt;
+        final long seq;
+
+        TableEntry(Long connectionId, String table, TableInfo data, long expireAt, long capturedAt, long seq) {
+            this.connectionId = connectionId;
+            this.table = table;
+            this.data = data;
+            this.expireAt = expireAt;
+            this.capturedAt = capturedAt;
+            this.seq = seq;
         }
     }
 

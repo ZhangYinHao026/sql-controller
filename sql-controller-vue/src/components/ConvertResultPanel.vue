@@ -132,7 +132,7 @@ watch(() => props.modelValue, () => scheduleGutterSync())
     flex-direction: column;
     border: 1px solid var(--line);
     border-radius: var(--r-md);
-    background: #fff;
+    background: var(--panel-plain-bg);
     overflow: hidden;
     min-width: 0;
 }
@@ -142,7 +142,7 @@ watch(() => props.modelValue, () => scheduleGutterSync())
     gap: 8px;
     padding: 9px 12px;
     background: var(--bg, var(--mint-50));
-    border-bottom: 1px solid rgba(0, 0, 0, .05);
+    border-bottom: 1px solid var(--line);
 }
 .rp-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dot, var(--mint-400)); flex: 0 0 9px; }
 .rp-name { font-size: 13px; font-weight: 800; color: var(--ink-900); }
@@ -153,20 +153,20 @@ watch(() => props.modelValue, () => scheduleGutterSync())
     font-weight: 800;
     padding: 2px 8px;
     border-radius: var(--r-pill);
-    background: #fff;
+    background: var(--panel-plain-bg);
     border: 1px solid var(--line);
     color: var(--ink-300);
     display: inline-flex;
     align-items: center;
     gap: 5px;
 }
-.rp-status.done { color: var(--mint-600); border-color: var(--mint-200); background: #fff; }
-.rp-status.error { color: #C96080; border-color: #F4C0D1; background: #FFF; }
-.rp-status.loading { color: #C77B00; border-color: #F5D9A8; background: #FFF8E5; }
+.rp-status.done { color: var(--mint-600); border-color: var(--mint-200); background: var(--panel-plain-bg); }
+.rp-status.error { color: var(--danger-ink); border-color: var(--danger-soft-border); background: var(--panel-plain-bg); }
+.rp-status.loading { color: var(--amber-deep); border-color: var(--online-border); background: var(--chip-amber-bg); }
 .rp-status .spinner {
     width: 9px; height: 9px;
-    border: 1.5px solid #F5D9A8;
-    border-top-color: #C77B00;
+    border: 1.5px solid var(--online-border);
+    border-top-color: var(--amber-deep);
     border-radius: 50%;
     animation: rp-spin .8s linear infinite;
 }
@@ -175,11 +175,11 @@ watch(() => props.modelValue, () => scheduleGutterSync())
 
 .rp-warns { list-style: none; padding: 8px 12px 0; margin: 0; }
 .rp-warns li {
-    font-size: 11px; color: #8a5d00; background: #FFF8E5;
-    border-left: 3px solid #E0A100;
+    font-size: 11px; color: var(--amber-deep); background: var(--chip-amber-bg);
+    border-left: 3px solid var(--amber-border);
     padding: 3px 8px; margin-bottom: 5px; border-radius: 0 6px 6px 0; line-height: 1.6;
 }
-.rp-error { margin: 8px 12px 0; font-size: 12px; color: #B95A5A; background: #FDF0F0; border-radius: 8px; padding: 5px 10px; }
+.rp-error { margin: 8px 12px 0; font-size: 12px; color: var(--danger-ink); background: var(--danger-soft-bg); border-radius: 8px; padding: 5px 10px; }
 
 .rp-code { position: relative; flex: 1; min-height: 130px; display: flex; --sbw: 0px; }
 .rp-hl, .rp-ta {
@@ -198,7 +198,7 @@ watch(() => props.modelValue, () => scheduleGutterSync())
     /* 关键：让出 textarea 竖向滚动条的占宽，与 .rp-ta 的内容区严格对齐，
        否则结果一长（出现滚动条）两层换行点错开，选中会「错乱」 */
     padding-right: calc(13px + var(--sbw, 0px));
-    background: linear-gradient(180deg, #FFFDF7, #FFF8E8);
+    background: linear-gradient(180deg, var(--grad-panel-a), var(--grad-panel-b));
     color: var(--ink-900);
     overflow: hidden;
     pointer-events: none;
@@ -218,11 +218,11 @@ watch(() => props.modelValue, () => scheduleGutterSync())
 .rp-ta::placeholder { color: var(--ink-300); }
 .rp-ta:focus { box-shadow: inset 0 0 0 2px rgba(107, 206, 178, .35); border-radius: 0; }
 .rp-ta::selection { background: rgba(107, 206, 178, .35); color: transparent; }
-.rp-hl :deep(.sql-string) { color: #4FA377; }
+.rp-hl :deep(.sql-string) { color: var(--sql-str); }
 .rp-hl :deep(.sql-comment) { color: var(--ink-300); font-style: italic; }
-.rp-hl :deep(.sql-number) { color: #B07AC9; }
+.rp-hl :deep(.sql-number) { color: var(--sql-num); }
 
-.rp-skeleton { flex: 1; padding: 13px; display: flex; flex-direction: column; gap: 9px; background: linear-gradient(180deg, #FFFDF7, #FFF8E8); }
+.rp-skeleton { flex: 1; padding: 13px; display: flex; flex-direction: column; gap: 9px; background: linear-gradient(180deg, var(--grad-panel-a), var(--grad-panel-b)); }
 .rp-skeleton i { height: 9px; border-radius: 5px; background: var(--mint-100); animation: rp-br 1.1s ease-in-out infinite; }
 .rp-skeleton i:nth-child(2) { animation-delay: .12s; }
 .rp-skeleton i:nth-child(3) { animation-delay: .24s; }
@@ -234,7 +234,7 @@ watch(() => props.modelValue, () => scheduleGutterSync())
     padding: 6px 12px;
     font-size: 10.5px;
     color: var(--ink-300);
-    background: #FFFDF8;
+    background: var(--panel-plain-bg);
     border-top: 1px solid var(--line);
     text-align: right;
 }

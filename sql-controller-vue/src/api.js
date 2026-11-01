@@ -70,6 +70,30 @@ const request = async (path, options = {}) => {
     }
 }
 
+/** 下载类接口（CSV 导出）：request() 按文本解析，二进制与文件名要单独处理。 */
+const download = async (path, body) => {
+    const response = await fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    })
+    if (!response.ok) {
+        const text = await response.text()
+        let message = text
+        try {
+            message = JSON.parse(text)?.message || text
+        } catch (e) {
+            // 非 JSON 错误体：原样展示
+        }
+        throw new Error(`[${response.status}] 导出失败${message ? ` · ${String(message).slice(0, 200)}` : ''}`)
+    }
+    const disposition = response.headers.get('content-disposition') || ''
+    const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition)
+    const plain = /filename="?([^";]+)"?/i.exec(disposition)
+    const filename = encoded ? decodeURIComponent(encoded[1]) : (plain ? plain[1] : 'export.csv')
+    return {blob: await response.blob(), filename}
+}
+
 export const api = {
     types: () => request('/api/database/types'),
     connections: (dbType, keyword) => request(`/api/database/connections?${new URLSearchParams({...(dbType ? {dbType} : {}), ...(keyword ? {keyword} : {})})}`),
@@ -145,5 +169,79 @@ export const api = {
     }),
     onlineWrite: (body) => request('/api/online/write', {
         method: 'POST', body: JSON.stringify(body), timeoutMs: 90000
+    }),
+    /* ---------------- 表浏览（/api/db 只读） ---------------- */
+    // 表清单（表名 + 注释）。keyword 交给后端过滤，避免大库把全部表名拉到前端再筛。
+    dbTables: (connectionId, keyword) => request(`/api/db/tables?${new URLSearchParams({
+        connectionId,
+        ...(keyword ? {keyword} : {})
+    })}`),
+    // 单表结构 + DDL；refresh=true 仅表达「我要最新的」，后端 tableNames 分支本身就会真查
+    dbTable: (connectionId, name, refresh) => request(`/api/db/table?${new URLSearchParams({
+        connectionId,
+        name,
+        ...(refresh ? {refresh: 'true'} : {})
+    })}`, {timeoutMs: 120000}),
+    dbTableData: (body) => request('/api/db/table-data', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 180000
+    }),
+    // 写开关状态（默认全关）：关掉时前端不渲染任何编辑入口
+    dbWriteStatus: () => request('/api/db/write-status'),
+    // 行级增删改：dryRun=true 只返回将要执行的 SQL（确认框展示的就是这条）
+    dbRowUpdate: (body) => request('/api/db/rows/update', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 180000
+    }),
+    dbRowInsert: (body) => request('/api/db/rows/insert', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 180000
+    }),
+    dbRowDelete: (body) => request('/api/db/rows/delete', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 180000
+    }),
+    // 结构编辑：preview 只出 DDL，execute 逐条执行（confirmed 必须为 true）
+    dbStructurePreview: (body) => request('/api/db/structure/preview', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 120000
+    }),
+    dbStructureExecute: (body) => request('/api/db/structure/execute', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 660000
+    }),
+    // CSV 导出走 blob：request() 会按文本解析，二进制/文件名都得单独处理
+    dbTableExport: (body) => download('/api/db/table-export', body),
+    // 手动刷新结构缓存（缓存默认永不过期）：传 table 只清这张表，不传清整个库（连带联想缓存）
+    dbCacheRefresh: (connectionId, table) => request(`/api/db/cache/refresh?${new URLSearchParams({
+        connectionId,
+        ...(table ? {table} : {})
+    })}`, {method: 'POST'}),
+    /* ---------------- 线上（生产）表浏览：与本地同构，仅前缀不同 ---------------- */
+    onlineDbTables: (connectionId, keyword) => request(`/api/online/db/tables?${new URLSearchParams({
+        connectionId,
+        ...(keyword ? {keyword} : {})
+    })}`, {timeoutMs: 120000}),
+    onlineDbTable: (connectionId, name, refresh) => request(`/api/online/db/table?${new URLSearchParams({
+        connectionId, name,
+        ...(refresh ? {refresh: 'true'} : {})
+    })}`, {timeoutMs: 180000}),
+    // 线上结构缓存刷新（与本地同构）：线上一次未命中就是 3 次小助手往返，缓存收益更大
+    onlineDbCacheRefresh: (connectionId, table) => request(`/api/online/db/cache/refresh?${new URLSearchParams({
+        connectionId,
+        ...(table ? {table} : {})
+    })}`, {method: 'POST'}),
+    onlineDbTableData: (body) => request('/api/online/db/table-data', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 180000
+    }),
+    onlineDbTableExport: (body) => download('/api/online/db/table-export', body),
+    onlineDbRowUpdate: (body) => request('/api/online/db/rows/update', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 120000
+    }),
+    onlineDbRowInsert: (body) => request('/api/online/db/rows/insert', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 120000
+    }),
+    onlineDbRowDelete: (body) => request('/api/online/db/rows/delete', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 120000
+    }),
+    onlineDbDdl: (body) => request('/api/online/db/ddl/execute', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 660000
+    }),
+    onlineDbStructurePreview: (body) => request('/api/online/db/structure/preview', {
+        method: 'POST', body: JSON.stringify(body), timeoutMs: 120000
     })
 }

@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SQL 工作台</title>
     <link rel="icon" type="image/jpeg" href="/icon/tabIcon.jpg">
+    <script>
+      // 防主题切换白屏闪烁：在 CSS 加载前就把 data-theme 写到 <html>（与 utils/theme.js 同 key）
+      try {
+        document.documentElement.dataset.theme =
+          localStorage.getItem('sql-controller-theme') === 'supabase' ? 'supabase' : 'mint'
+      } catch (e) { /* ignore */ }
+    </script>
   </head>
   <body>
     <div id="app"></div>
