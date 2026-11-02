@@ -20,6 +20,8 @@ import {api} from '../api'
 import {eqName, genCreateTable, genIndexStmts, indexCols, indexDiff, commentDiff, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, toEngineIndexes, typeForTarget, appendOrReplaceBlock} from '../utils/schemaDiff'
 import {assembleStatements} from '../utils/sqlStatements'
 import {typeLabel} from '../utils/dbRegistry'
+import {pruneDiffSession} from '../state/diffSession'
+import * as diffSession from '../state/diffSession'
 import ConfirmDialog from './ConfirmDialog.vue'
 import DiffPatchDialog from './DiffPatchDialog.vue'
 import DiffRow from './DiffRow.vue'
@@ -39,26 +41,16 @@ const allConns = computed(() => [
 ])
 const emit = defineEmits(['close', 'run', 'toast'])
 
-/* ---------------- 状态 ---------------- */
-const libs = reactive({})            // connId → {id,name,dbType,fetchedAt,error,tables:{t:[engineCol]}}
+/* ---------------- 状态 ----------------
+ * 快照、库选择、列处理选择、补丁分桶等「攒出来的会话状态」放在 state/diffSession.js（模块级），
+ * 关闭弹窗不丢；这里只保留每次打开都要干净起步的 UI 状态。 */
+const {libs, diffBase, diffCmps, diffCmp, diffState, applied, patchBuckets, patchOrder} = diffSession
 const fetching = ref(false)
-const diffBase = ref(null)           // 基准连接 id
-const diffCmps = ref([])             // 勾选的比对库 id（有序）
-const diffCmp = ref(null)            // 单表核对激活的比对库 id
 const diffTable = ref(null)
 const diffMode = ref('summary')
 const search = ref('')
 const onlyDiff = ref(false)
 const detailOnlyDiff = ref(false)   // 单表核对：仅显示差异字段（隐藏「一致」行）
-const diffState = reactive({})       // `${cmp}|${table}|${field}` -> 'add'|'drop'|'mod'|'skip'|'back'
-const applied = reactive({})         // `${cmp}|${table}` -> true
-/* ---- 补丁：按目标库分桶（每个比对库一桶 + 基准库一桶），生成只累积、可攒批统一执行 ----
- *   key = String(目标库 connectionId)；status: idle(待执行) / running(执行中) / done(成功·已清空文本) / fail(失败·可重试)
- *   text = 源脚本（MySQL 风格，可编辑，执行时经转换器按目标库方言翻译）
- *   dialectText/dialectType/dialectWarn/dialectErr = 「目标方言视图」（目标库非 MySQL 时异步生成，
- *     由后端转换器产出，补丁弹窗默认展示，只读、可复制 —— 让生成的 SQL 按库类型看得见） */
-const patchBuckets = reactive({})        // key -> {id, text, edited, status, info, dialectText?, dialectType?, dialectWarn?, dialectErr?}
-const patchOrder = ref([])               // 有序 key（列表顺序 = 创建顺序）
 const patchActive = ref(null)            // 弹窗当前选中的 key
 const patchOpen = ref(false)             // 补丁弹窗是否打开
 const dialectTimers = {}                 // key -> 方言视图刷新防抖 timer
@@ -842,7 +834,13 @@ function onEsc(e) {
   if (e.key !== 'Escape' || !props.show) return
   if (guard.show) { guardCancel(); return }
   if (patchOpen.value) { closePatch(); return }
+  if (cmpOpen.value) { cmpOpen.value = false; return }
   emit('close')
+}
+/** 点面板与入口之外关闭比对库面板（鼠标移出就收会误关，改用点击外部）。 */
+function onDocClick(e) {
+  if (!cmpOpen.value) return
+  if (cmpPickRef.value && !cmpPickRef.value.contains(e.target)) cmpOpen.value = false
 }
 function toast(m) { emit('toast', m) }
 
@@ -1113,6 +1111,17 @@ const baseType = computed(() => {
 const CMP_COLLAPSE_AT = 14
 const cmpFilter = ref('')
 const expandedScopes = reactive({local: true, online: true})
+/** 比对库选择面板是否展开（常态收起，只占工具栏一行）。 */
+const cmpOpen = ref(false)
+const cmpPickRef = ref(null)
+const cmpTriggerTitle = computed(() => {
+  if (!diffCmps.value.length) return '选择要比对的库（可多选）'
+  return `已选 ${diffCmps.value.length} 个：${diffCmps.value.map(libName).join('、')}（点击修改）`
+})
+function clearCmps() {
+  diffCmps.value = []
+  diffCmp.value = null
+}
 const cmpHit = (c, kw) => !kw || String(c.regionName || '').toLowerCase().includes(kw) || typeLabel(c.dbType).toLowerCase().includes(kw)
 const cmpScopeGroups = computed(() => {
   const kw = cmpFilter.value.trim().toLowerCase()
@@ -1180,8 +1189,18 @@ const fetchStamp = computed(() => {
   return `快照 ${scope.length} 库 · ${at.toLocaleTimeString('zh-CN', {hour12: false})}`
 })
 /* Esc 关闭（× / Esc 是唯一关闭途径；guard 打开时 Esc 先关 guard，补丁弹窗打开时先关弹窗） */
-onMounted(() => window.addEventListener('keydown', onEsc))
-onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
+watch(() => props.show, v => {
+  // 打开时剔除已失效连接（被删除 / 线上区域下线）的会话残留；快照、勾选、补丁原样保留
+  if (v) pruneDiffSession(new Set(allConns.value.map(c => c.id)))
+})
+onMounted(() => {
+  window.addEventListener('keydown', onEsc)
+  document.addEventListener('click', onDocClick)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onEsc)
+  document.removeEventListener('click', onDocClick)
+})
 </script>
 
 <template>
@@ -1207,39 +1226,64 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
             </option>
           </optgroup>
         </select>
-        <span class="label">比对库（可多选）</span>
-        <input v-model="cmpFilter" class="input diff-cmp-filter" placeholder="🔍 搜索省份/类型" :disabled="fetching" />
-        <div class="diff-cmp-list">
-          <span v-for="sc in cmpScopeGroups" :key="'s' + sc.key" class="diff-cmp-scope" :class="'scope-' + sc.key">
-            <b class="scope-name">{{ sc.label }}</b>
-            <span v-for="g in sc.groups" :key="'g' + sc.key + g.type" class="diff-cmp-group">
-              <b>{{ g.typeName }}</b>
-              <label v-for="c in g.list" :key="c.id" :class="{ cross: c.dbType !== baseType, 'failed-lib': !!libs[c.id]?.error }"
-                     :title="libs[c.id]?.error ? '快照失败：' + libs[c.id].error : (c.dbType !== baseType ? '跨方言库：生成时按该库方言产出补丁（补丁弹窗默认展示已转换的目标方言脚本），执行按源脚本经转换器下发' : '')">
-                <input type="checkbox" :disabled="fetching || !!libs[c.id]?.error" :checked="diffCmps.includes(c.id)"
-                       @change="toggleCmp(c.id, $event.target.checked)">
-                {{ c.regionName }}<span v-if="libs[c.id]?.error" class="fail-mark">✗</span>
-                <span v-else-if="!hasSnap(c.id)" class="pend-mark" title="尚未拉取该库快照：勾选后点「▶ 拉取快照」抓取结构">待拉取</span>
-              </label>
-              <a v-if="g.hidden > 0" class="more-cmp" @click.prevent="expandedScopes[sc.key] = true">…还有 {{ g.hidden }}</a>
-            </span>
-          </span>
-          <span v-if="!cmpScopeGroups.length" class="muted">{{ cmpFilter ? '没有匹配的库' : '无其他库可选' }}</span>
+
+        <!-- 比对库：常态只占工具栏一行的一个入口，点开才展开搜索与库列表（库多时面板内滚动，不再把工具栏撑高） -->
+        <div ref="cmpPickRef" class="cmp-pick">
+          <button type="button" class="cmp-trigger" :class="{ open: cmpOpen, has: !!diffCmps.length }"
+                  :disabled="fetching" :title="cmpTriggerTitle"
+                  @click="cmpOpen = !cmpOpen">
+            <span class="cmp-pre">比对库</span>
+            <template v-if="diffCmps.length">
+              <i class="cmp-tag">{{ libName(diffCmps[0]) }}</i>
+              <i v-if="diffCmps.length > 1" class="cmp-tag cmp-tag-more">+{{ diffCmps.length - 1 }}</i>
+            </template>
+            <span v-else class="cmp-ph">（可多选）</span>
+            <span class="cmp-caret">▾</span>
+          </button>
+
+          <div v-if="cmpOpen" class="cmp-pop">
+            <div class="cmp-pop-head">
+              <input v-model="cmpFilter" class="input diff-cmp-filter" placeholder="🔍 搜索省份/类型" :disabled="fetching" />
+              <span class="cmp-pop-cnt">已选 {{ diffCmps.length }}</span>
+              <button type="button" class="reset-link" :disabled="!diffCmps.length || fetching" @click="clearCmps">清空</button>
+              <button type="button" class="btn small" @click="cmpOpen = false">完成</button>
+            </div>
+            <div class="cmp-pop-body">
+              <div class="diff-cmp-list">
+                <span v-for="sc in cmpScopeGroups" :key="'s' + sc.key" class="diff-cmp-scope" :class="'scope-' + sc.key">
+                  <b class="scope-name">{{ sc.label }}</b>
+                  <span v-for="g in sc.groups" :key="'g' + sc.key + g.type" class="diff-cmp-group">
+                    <b>{{ g.typeName }}</b>
+                    <label v-for="c in g.list" :key="c.id" :class="{ cross: c.dbType !== baseType, 'failed-lib': !!libs[c.id]?.error, checked: diffCmps.includes(c.id) }"
+                           :title="libs[c.id]?.error ? '快照失败：' + libs[c.id].error : (c.dbType !== baseType ? '跨方言库：生成时按该库方言产出补丁（补丁弹窗默认展示已转换的目标方言脚本），执行按源脚本经转换器下发' : '')">
+                      <input type="checkbox" :disabled="fetching || !!libs[c.id]?.error" :checked="diffCmps.includes(c.id)"
+                             @change="toggleCmp(c.id, $event.target.checked)">
+                      {{ c.regionName }}<span v-if="libs[c.id]?.error" class="fail-mark">✗</span>
+                      <span v-else-if="!hasSnap(c.id)" class="pend-mark" title="尚未拉取该库快照：勾选后点「▶ 拉取快照」抓取结构">待拉取</span>
+                    </label>
+                    <a v-if="g.hidden > 0" class="more-cmp" @click.prevent="expandedScopes[sc.key] = true">…还有 {{ g.hidden }}</a>
+                  </span>
+                </span>
+                <span v-if="!cmpScopeGroups.length" class="muted">{{ cmpFilter ? '没有匹配的库' : '无其他库可选' }}</span>
+              </div>
+            </div>
+          </div>
         </div>
+
         <button type="button" class="btn small snap-btn" :disabled="!fetchReady || fetching"
                 :title="fetchReady ? '' : '先选择基准库并勾选比对库'" @click="fetchAll(false)">
           {{ fetching ? '抓取中…' : '▶ 拉取快照' }}
         </button>
         <button type="button" class="reset-link" :disabled="fetching" :title="'跳过缓存强制重抓当前勾选库'"
                 @click="fetchAll(true)">⟳ 强制重抓</button>
-        <span class="snap-stamp">{{ fetchStamp }}</span>
+        <span class="snap-stamp" :title="fetchStamp">{{ fetchStamp }}</span>
         <button type="button" class="btn small patch-entry" :class="{ has: !!patchBadge }" :disabled="!patchEntryEnabled"
                 :title="patchEntryEnabled ? '打开补丁工作台：各目标库脚本已分桶累积，可逐库或统一执行（含执行状态）' : '先生成补丁（单表核对 / 自动补齐缺列 / 缺表建表）后这里会显示行数'"
                 @click="openPatch()">
           📋 补丁脚本<span v-if="patchBadge" class="patch-entry-cnt">{{ patchBadge }}</span>
         </button>
         <button type="button" class="reset-link" @click="clearAll"
-                title="复位对比会话：撤销「已生成补丁/✓已应用」标记、清空全部待执行补丁、清空所选基准/比对库与差异表列表；不影响已执行到库的改动">↺ 撤销「已应用」</button>
+                title="复位对比会话：撤销「已生成补丁/✓已应用」标记、清空全部待执行补丁、清空所选基准/比对库与差异表列表；不影响已执行到库的改动">↺ 撤销已应用</button>
       </div>
 
       <div class="diff-main">
@@ -1467,20 +1511,54 @@ export default { name: 'SchemaDiffDialog' }
 .diff-toolbar select { border: 1.5px solid var(--ink-100); border-radius: 8px; padding: 6px 10px; background: var(--surface); color: var(--ink-900); font-size: 12.5px; }
 .diff-select { min-width: 150px; }
 .diff-cmp-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* 比对库入口：常态与「基准库」下拉同高（32px），只占工具栏一行；
+   库列表收进面板内部滚动，不再把工具栏撑高三四行 */
+.cmp-pick { position: relative; flex: 0 0 auto; }
+.cmp-trigger { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; height: 32px; padding: 0 10px; border-radius: 8px; border: 1.5px solid var(--ink-100); background: var(--surface); color: var(--ink-700); font-size: 12.5px; cursor: pointer; transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease); }
+.cmp-trigger:hover { border-color: var(--mint-300); }
+.cmp-trigger.open { border-color: var(--mint-500); box-shadow: 0 0 0 3px var(--mint-100); }
+.cmp-trigger.has { color: var(--mint-700); font-weight: 700; }
+.cmp-ph { color: var(--ink-300); white-space: nowrap; }
+.cmp-pre { color: var(--ink-500); font-size: 12px; white-space: nowrap; }
+.cmp-trigger.has .cmp-pre { color: var(--mint-700); }
+.cmp-tag { font-style: normal; font-size: 11.5px; padding: 1px 7px; border-radius: var(--r-pill); background: var(--mint-100); color: var(--mint-700); white-space: nowrap; max-width: 96px; overflow: hidden; text-overflow: ellipsis; }
+.cmp-tag-more { background: var(--ink-50); color: var(--ink-500); }
+.cmp-caret { font-size: 10px; color: var(--ink-300); transition: transform var(--t-fast) var(--ease); }
+.cmp-trigger.open .cmp-caret { transform: rotate(180deg); }
+.cmp-pop { position: absolute; z-index: 60; top: calc(100% + 6px); left: 0; width: min(620px, 92vw); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 14px 34px rgba(0, 0, 0, .18); }
+.cmp-pop-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.cmp-pop-head .diff-cmp-filter { flex: 1 1 auto; width: auto; min-width: 0; }
+.cmp-pop-cnt { font-size: 11.5px; color: var(--ink-500); white-space: nowrap; }
+.cmp-pop-body { max-height: min(340px, 48vh); overflow-y: auto; padding: 10px; }
+/* 面板内：本地/线上各一块（浅底区分），组内每个类型单独一行；去掉原先药丸外框，避免换行后色块错位 */
+.cmp-pop-body .diff-cmp-list { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.cmp-pop-body .diff-cmp-scope { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: 100%; padding: 7px 9px; border-radius: 10px; }
+.cmp-pop-body .diff-cmp-scope.scope-local { background: var(--cream-50); }
+.cmp-pop-body .diff-cmp-scope.scope-online { background: var(--mint-50); border: 1px dashed var(--mint-200); }
+.cmp-pop-body .diff-cmp-scope .scope-name { padding: 0; border-right: 0; letter-spacing: .04em; }
+.cmp-pop-body .diff-cmp-group { background: transparent; border: 0; padding: 0; gap: 4px; max-width: 100%; }
+.cmp-pop-body .diff-cmp-group > b { flex: 0 0 auto; min-width: 46px; }
+
 /* 「本地/线上」双组：线上组描一圈薄荷色以示区分（线上=生产库） */
 .diff-cmp-filter { width: 150px; padding: 5px 10px; font-size: 12px; border: 1.5px solid var(--ink-100); border-radius: var(--r-pill); background: var(--surface); color: var(--ink-900); }
-.diff-cmp-scope { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 2px 8px 2px 4px; border-radius: var(--r-pill); }
+.diff-cmp-scope { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; max-width: 100%; padding: 2px 8px 2px 4px; border-radius: var(--r-pill); }
 .diff-cmp-scope.scope-online { background: var(--mint-50); border: 1px dashed var(--mint-200); }
 .diff-cmp-scope .scope-name { font-size: 11px; font-weight: 800; color: var(--ink-500); padding: 0 6px; border-right: 1px solid var(--ink-100); }
 .diff-cmp-scope.scope-online .scope-name { color: var(--mint-700); border-right-color: var(--mint-200); }
 .more-cmp { font-size: 11px; color: var(--mint-700); cursor: pointer; text-decoration: underline; white-space: nowrap; }
-.diff-cmp-group { display: flex; align-items: center; gap: 2px; background: var(--ink-50); border: 1px solid var(--ink-100); border-radius: var(--r-pill); padding: 3px 5px 3px 10px; }
+.diff-cmp-group { display: flex; align-items: center; flex-wrap: wrap; max-width: 100%; gap: 3px; background: var(--ink-50); border: 1px solid var(--ink-100); border-radius: var(--r-pill); padding: 3px 5px 3px 8px; }
 .diff-cmp-group b { font-size: 11px; color: var(--ink-500); font-weight: 700; margin-right: 2px; }
-.diff-cmp-group label { display: flex; align-items: center; gap: 3px; font-size: 12px; color: var(--ink-700); padding: 2px 8px; border-radius: var(--r-pill); cursor: pointer; }
-.diff-cmp-group label:hover { background: var(--mint-100); }
-.diff-cmp-group label input { accent-color: var(--mint-500); margin: 0; }
+/* 每个库是一个独立胶囊：底色用 --surface（亮色=白、暗色=比托盘更深一档），
+   默认带极浅边框，保证暗色主题下也能看出边界；勾选后换薄荷底 + 主色描边 */
+.diff-cmp-group label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-700); padding: 2px 8px; border-radius: var(--r-pill); border: 1px solid var(--ink-100); background: var(--surface); cursor: pointer; transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease); white-space: nowrap; }
+.diff-cmp-group label:hover { background: var(--mint-50); border-color: var(--mint-200); }
+.diff-cmp-group label.checked { background: var(--mint-100); border-color: var(--mint-500); color: var(--mint-700); font-weight: 700; }
+.diff-cmp-group label.checked:hover { background: var(--mint-100); }
+.diff-cmp-group label input { accent-color: var(--mint-500); margin: 0; width: 13px; height: 13px; flex: 0 0 auto; }
 .diff-cmp-group label.cross { color: var(--ink-300); font-style: italic; }
-.diff-cmp-group label.failed-lib { color: var(--danger); text-decoration: line-through; cursor: not-allowed; }
+.diff-cmp-group label.cross.checked { color: var(--mint-700); }
+.diff-cmp-group label.failed-lib { color: var(--danger); text-decoration: line-through; cursor: not-allowed; background: transparent; border-color: transparent; }
 .fail-mark { color: var(--danger); font-weight: 800; }
 /* 比对库勾选 label 上的该库 vs 基准 微型差异徽章 */
 .cmp-mini { font-size: 10px; font-weight: 800; border-radius: var(--r-pill); padding: 0 6px; line-height: 15px; white-space: nowrap; }
@@ -1488,7 +1566,7 @@ export default { name: 'SchemaDiffDialog' }
 .cmp-mini.ok { background: var(--mint-100); color: var(--mint-700); }
 .pend-mark { font-size: 10px; font-weight: 800; color: var(--tint-add-ink); background: var(--tint-add-bg); border-radius: var(--r-pill); padding: 0 6px; line-height: 15px; }
 .snap-btn { margin-left: auto; }
-.snap-stamp { font-size: 11px; color: var(--ink-300); }
+.snap-stamp { font-size: 11px; color: var(--ink-300); max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .patch-entry { display: inline-flex; align-items: center; gap: 6px; }
 .patch-entry.has { border-color: var(--cream-300); background: linear-gradient(180deg, var(--grad-panel-a), var(--cream-50)); color: var(--amber-ink2); }
 .patch-entry.has:hover { border-color: var(--amber-border); }

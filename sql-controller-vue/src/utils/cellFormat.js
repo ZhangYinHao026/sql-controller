@@ -62,6 +62,20 @@ export function cellTitle(value) {
     return text.length > 2000 ? `${text.slice(0, 2000)}…` : text
 }
 
+/**
+ * 单元格悬停提示（带编辑语义）：NULL 与空串肉眼看不清，悬停说明「怎么把它设成什么」。
+ * 普通值退化为 cellTitle。
+ */
+export function cellHint(value) {
+    if (value === null || value === undefined) {
+        return 'NULL —— 编辑时清空输入框并提交，即设回 NULL'
+    }
+    if (value === '') {
+        return "空字符串（''）—— 编辑时输入 '' 并提交，即设为空串"
+    }
+    return cellTitle(value)
+}
+
 /** 行号：跨页连续。 */
 export function rowNumber(page, pageSize, index) {
     const current = Math.max(1, Number(page) || 1)

@@ -9,7 +9,7 @@
  * - 没有主键、写开关关闭、线上未开写权限时，双击不进入编辑并给出原因。
  */
 import { computed, ref } from 'vue'
-import { cellTitle, formatCell, isDateType, isNumericType, rowNumber } from '../../utils/cellFormat'
+import { cellHint, cellTitle, formatCell, isDateType, isNumericType, rowNumber } from '../../utils/cellFormat'
 import { rowKey } from '../../utils/rowDiff'
 
 const props = defineProps({tab: {type: Object, required: true}})
@@ -110,7 +110,9 @@ function startEdit(item, column) {
   editing.value = {
     key: item.key,
     column: column.name,
-    value: raw === null || raw === undefined ? '' : String(raw)
+    value: raw === null || raw === undefined ? '' : String(raw),
+    // 原值状态：输入框占位符提示当前是 NULL 还是空串（两者进编辑时都是空输入框，肉眼看不出）
+    orig: raw === null || raw === undefined ? 'null' : (raw === '' ? 'empty' : 'value')
   }
 }
 
@@ -127,8 +129,11 @@ function commit() {
   const beforeText = before === null || before === undefined ? '' : String(before)
   if (beforeText === value) return
 
-  // 清空 = NULL（列可空时）；不可空列交给数据库报错，不静默塞空串
-  const normalized = value === '' && column.nullable !== false ? null : value
+  // 清空 = NULL（列可空时，不可空列交给数据库报错）；输入 ''（两个单引号）= 空字符串
+  // 之前的版本没法把可空列设回空串（清空永远变 NULL），这里补上 Navicat 同款约定
+  const normalized = value === "''"
+    ? ''
+    : (value === '' && column.nullable !== false ? null : value)
 
   if (item.draft) {
     item.draft.values[state.column] = normalized
@@ -185,13 +190,15 @@ defineExpose({startEdit})
           @click="selectRow(item.key)">
         <td class="db-grid-no">{{ item.draft ? '新' : rowNumber(tab.page, tab.pageSize, index - (tab.drafts || []).length) }}</td>
         <td v-for="column in columns" :key="column.name" :class="cellClass(item, column)"
-            :title="cellTitle(cellValue(item, column))"
+            :title="cellHint(cellValue(item, column))"
             @dblclick.stop="startEdit(item, column)">
           <input v-if="editing && editing.key === item.key && editing.column === column.name"
                  v-model="editing.value" v-focus class="cell-input" spellcheck="false"
+                 :placeholder="editing.orig === 'null' ? '(NULL)' : (editing.orig === 'empty' ? `('')` : '')"
                  @keydown.enter.prevent="commit" @keydown.esc.prevent="cancel" @blur="commit"/>
           <template v-else>
             <span v-if="cellText(item, column).kind === 'null'" class="db-null">NULL</span>
+            <span v-else-if="cellText(item, column).text === ''" class="db-empty">''</span>
             <span v-else :class="{'db-blob': cellText(item, column).kind === 'blob'}">{{ cellText(item, column).text }}</span>
           </template>
         </td>

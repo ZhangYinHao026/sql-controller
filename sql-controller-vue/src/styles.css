@@ -1502,6 +1502,7 @@ button { cursor: pointer; }
 .db-grid tbody tr.selected td { background: var(--row-active-grad); }
 .db-grid td.is-number { text-align: right; }
 .db-null { color: var(--ink-300); font-style: italic; }
+.db-empty { color: var(--ink-300); letter-spacing: -1px; }
 .db-grid td.is-date { color: var(--ink-700); }
 .db-blob { color: var(--ink-300); }
 .db-grid-no {
