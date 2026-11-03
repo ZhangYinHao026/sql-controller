@@ -50,6 +50,7 @@ const cardLoading = reactive({})
 const nodes = ref([]), nodesLoading = ref(false)
 const dialogs = reactive({settings: false, connectionForm: false, onlineForm: false, history: false, confirmDelete: false, confirmOnlineDelete: false, convert: false, diff: false}), historyItems = ref([]), historyLoading = ref(false),
     historyPage = ref(1), historyPageSize = ref(10), historyTotal = ref(0),
+    historyKind = ref('all'), historyCounts = ref(null),
     settingsLoading = ref(false), settingsConnections = ref([]), editingConnection = ref(null),
     pendingDelete = ref(null)
 /* 类型 chips 名称/顺序：统一从 dbRegistry 派生（新增类型只改注册表）。
@@ -910,14 +911,20 @@ async function loadHistory(targetPage) {
   if (historyLoading.value) return;
   historyLoading.value = true;
   try {
-    const data = await api.history({page: targetPage, pageSize: Number(historyPageSize.value)}) || []
+    const params = {page: targetPage, pageSize: Number(historyPageSize.value)}
+    // 'all' 不传，后端不拼 sql_type 条件
+    if (historyKind.value !== 'all') params.kind = historyKind.value
+    const data = await api.history(params) || []
     if (Array.isArray(data)) {
       // 旧后端返回纯数组（无 total）：用"满页则有下一页"启发式
       historyItems.value = data;
       historyTotal.value = data.length < Number(historyPageSize.value) ? (targetPage - 1) * Number(historyPageSize.value) + data.length : -1
+      historyCounts.value = null
     } else {
       historyItems.value = data.content || [];
       historyTotal.value = Number(data.total || 0)
+      // 整表各档条数（后端统计，不受分页影响）；旧后端没有该字段则退回当前页计数
+      historyCounts.value = data.counts || null
     }
     historyPage.value = targetPage
   } catch (e) {
@@ -925,6 +932,13 @@ async function loadHistory(targetPage) {
   } finally {
     historyLoading.value = false
   }
+}
+
+/* 切换分档：换条件必须回到第 1 页，否则会停在超出范围的页码上 */
+function changeHistoryKind(kind) {
+  if (kind === historyKind.value) return
+  historyKind.value = kind
+  loadHistory(1)
 }
 
 function changeHistoryPageSize(size) {
@@ -1098,7 +1112,9 @@ onMounted(async () => {
   <HistoryDialog :show="dialogs.history" :items="historyItems" :loading="historyLoading"
                  :page="historyPage" :total-pages="historyTotalPages" :has-next="historyHasNext"
                  :page-size="historyPageSize" :total="historyTotal"
-                 @close="dialogs.history = false" @page="loadHistory" @page-size-change="changeHistoryPageSize"/>
+                 :filter="historyKind" :counts="historyCounts"
+                 @close="dialogs.history = false" @page="loadHistory" @page-size-change="changeHistoryPageSize"
+                 @filter="changeHistoryKind"/>
   <ConvertDialog :show="dialogs.convert" :connections="connections" @close="dialogs.convert = false" @use-result="runConverted" @execute-all="runConvertedAll"/>
   <SchemaDiffDialog :show="dialogs.diff" :connections="connections" :online-connections="onlineConnections"
                     @close="dialogs.diff = false" @run="runDiffScript" @toast="toast"/>

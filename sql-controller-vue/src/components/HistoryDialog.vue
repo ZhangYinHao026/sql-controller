@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
+import { categoryCounts } from '../utils/historyCategory.js'
 
 const props = defineProps({
   show: Boolean,
@@ -9,11 +10,14 @@ const props = defineProps({
   totalPages: { type: Number, default: 1 },
   hasNext: { type: Boolean, default: false },
   pageSize: { type: Number, default: 10 },
-  total: { type: Number, default: 0 }
+  total: { type: Number, default: 0 },
+  /* 当前分档：all / insert / update / delete（由父组件发起请求，后端过滤） */
+  filter: { type: String, default: 'all' },
+  /* 整表各档条数 { all, insert, update, delete }；缺省时退回当前页计数 */
+  counts: { type: Object, default: null }
 })
-defineEmits(['close', 'page', 'page-size-change'])
+const emit = defineEmits(['close', 'page', 'page-size-change', 'filter'])
 
-const filter = ref('all')
 const listWrap = ref(null)
 
 /* 翻页后滚回列表顶部，避免停留旧位置 */
@@ -28,28 +32,23 @@ function formatTime(s) {
   return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}` : s
 }
 
-/* 分类：按 sqlType 判断是查询还是修改 */
-const QUERY_TYPES = ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'WITH']
-const MODIFY_TYPES = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME']
-function category(type) {
-  const t = String(type || '').toUpperCase()
-  if (QUERY_TYPES.includes(t)) return 'query'
-  if (MODIFY_TYPES.includes(t)) return 'modify'
-  return 'other'
-}
+/* 分档计数：优先后端整表统计，否则按当前页估算（离线/接口未升级时不至于空白） */
 const counts = computed(() => {
-  const c = { all: 0, query: 0, modify: 0 }
-  for (const it of props.items || []) {
-    c.all++
-    if (category(it.sqlType) === 'query') c.query++
-    else if (category(it.sqlType) === 'modify') c.modify++
+  const c = props.counts
+  if (c && typeof c === 'object' && 'all' in c) {
+    return { all: Number(c.all) || 0, insert: Number(c.insert) || 0, update: Number(c.update) || 0, delete: Number(c.delete) || 0 }
   }
-  return c
+  return categoryCounts(props.items)
 })
-const filtered = computed(() => {
-  if (filter.value === 'all') return props.items || []
-  return (props.items || []).filter(it => category(it.sqlType) === filter.value)
-})
+
+const filtered = computed(() => props.items || [])
+
+const CHIPS = [
+  { key: 'all', label: '全部' },
+  { key: 'insert', label: '＋ 新增' },
+  { key: 'update', label: '✏ 修改' },
+  { key: 'delete', label: '🗑 删除' }
+]
 </script>
 <template>
   <div v-if="show" class="modal-mask" @click.self="$emit('close')">
@@ -61,9 +60,8 @@ const filtered = computed(() => {
       </Transition>
       <template v-if="items.length">
         <div class="history-filter">
-          <button class="filter-chip" :class="{active: filter==='all'}" @click="filter='all'">全部 <span class="cnt">{{ counts.all }}</span></button>
-          <button class="filter-chip" :class="{active: filter==='query'}" @click="filter='query'">🔍 查询 <span class="cnt">{{ counts.query }}</span></button>
-          <button class="filter-chip" :class="{active: filter==='modify'}" @click="filter='modify'">✏ 修改 <span class="cnt">{{ counts.modify }}</span></button>
+          <button v-for="c in CHIPS" :key="c.key" class="filter-chip" :class="[c.key, {active: filter === c.key}]"
+                  :disabled="loading" @click="$emit('filter', c.key)">{{ c.label }} <span class="cnt">{{ counts[c.key] }}</span></button>
           <span v-if="total >= 0" class="muted total-tip">共 {{ total }} 条</span>
         </div>
 
@@ -124,6 +122,11 @@ const filtered = computed(() => {
   color: var(--mint-700);
   transform: translateY(-1px);
 }
+.filter-chip:disabled {
+  opacity: .55;
+  cursor: default;
+  transform: none;
+}
 .filter-chip.active {
   background: var(--mint-100);
   border-color: var(--mint-300);
@@ -140,6 +143,28 @@ const filtered = computed(() => {
   font-weight: 700;
 }
 .filter-chip.active .cnt { background: var(--surface); color: var(--mint-700); }
+/* 三档选中态各用一个淡色块区分：新增=暖橙、修改=淡蓝、删除=淡红（暗色主题由 tint-* 变量自适应） */
+.filter-chip.insert.active {
+  background: var(--tint-add-bg);
+  border-color: var(--ink-200);
+  color: var(--tint-add-ink);
+  box-shadow: none;
+}
+.filter-chip.insert.active .cnt { color: var(--tint-add-ink); }
+.filter-chip.update.active {
+  background: var(--tint-alt-bg);
+  border-color: var(--ink-200);
+  color: var(--tint-alt-ink);
+  box-shadow: none;
+}
+.filter-chip.update.active .cnt { color: var(--tint-alt-ink); }
+.filter-chip.delete.active {
+  background: var(--tint-drop-bg);
+  border-color: var(--ink-200);
+  color: var(--tint-drop-ink);
+  box-shadow: none;
+}
+.filter-chip.delete.active .cnt { color: var(--tint-drop-ink); }
 .total-tip { margin-left: auto; padding: 0 12px; }
 
 /* 加载浮层：绝对定位覆盖，不占布局（避免弹窗内容高度变化导致抖动） */

@@ -16,12 +16,14 @@ public class SqlHistoryController {
     }
 
     @GetMapping
-    public Map<String, Object> list(@RequestParam(defaultValue = "1") int page, @RequestParam(defaultValue = "20") int pageSize, @RequestParam(required = false) String dbType, @RequestParam(required = false) String regionName, @RequestParam(required = false) String status) {
+    public Map<String, Object> list(@RequestParam(defaultValue = "1") int page, @RequestParam(defaultValue = "20") int pageSize, @RequestParam(required = false) String dbType, @RequestParam(required = false) String regionName, @RequestParam(required = false) String status,
+                                    @RequestParam(required = false) String kind) {
         int p = Math.max(1, page);
         int s = Math.min(100, Math.max(1, pageSize));
         Map<String, Object> result = new HashMap<>();
-        result.put("content", repo.list(p, s, dbType, regionName, status));
-        result.put("total", repo.count(dbType, regionName, status));
+        result.put("content", repo.list(p, s, dbType, regionName, status, kind));
+        result.put("total", repo.count(dbType, regionName, status, kind));
+        result.put("counts", repo.categoryCounts(dbType, regionName, status));
         result.put("page", p);
         result.put("pageSize", s);
         return result;
