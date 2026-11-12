@@ -1,5 +1,6 @@
 package com.sxwh.sqlcontroller.service;
 
+import com.sxwh.sqlcontroller.cache.SchemaCache;
 import com.sxwh.sqlcontroller.config.AutocompleteProperties;
 import com.sxwh.sqlcontroller.dialect.Dialect;
 import com.sxwh.sqlcontroller.dialect.DialectRegistry;
@@ -24,14 +25,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SQL 编辑器联想数据源服务。
@@ -53,31 +51,21 @@ public class SchemaService {
     private final DialectRegistry registry;
     private final AutocompleteProperties props;
 
-    /** 简单内存缓存：connectionId → (数据, 过期时间)。 */
-    private final Map<Long, CacheEntry> cache = new ConcurrentHashMap<>();
+    /** 联想缓存：connectionId → SchemaResponse，TTL 见 schema-cache-seconds。 */
+    private final SchemaCache<SchemaResponse> autocompleteCache;
 
-    /** 字段对比快照缓存：connectionId → (快照, 过期时间)，独立于联想缓存（不同 TTL 语义/数据源）。 */
-    private final Map<Long, SnapshotEntry> snapshotCache = new ConcurrentHashMap<>();
+    /** 字段对比整库快照缓存：connectionId → SchemaSnapshot，TTL 同上；filtered 分支不读不写。 */
+    private final SchemaCache<SchemaSnapshot> snapshotCache;
 
     /**
-     * 表浏览「单表结构」缓存：{@code connectionId:表名} → (结构, 过期时间)。
+     * 表浏览「单表结构」缓存：{@code connectionId:表名} → TableInfo。
      *
      * <p>为什么单独一层：整库快照的 filtered 分支（只查指定表）故意不读也不写缓存，
      * 用来保证「打完补丁立刻看到新结构」；表浏览要的是「查一次管很久」，语义不同，不能共用。
-     * TTL 见 {@link AutocompleteProperties#getTableCacheSeconds()}（默认 -1 = 永不过期，靠手动刷新）。
+     * TTL 见 {@link AutocompleteProperties#getTableCacheSeconds()}（默认 -1 = 永不过期，靠手动刷新）；
+     * 同 key 并发加载由缓存组件合并（打开表时前端会同时请求结构与数据）。
      */
-    private final Map<String, TableEntry> tableCache = new ConcurrentHashMap<>();
-
-    /**
-     * 同一张表的并发查询合并（single-flight）。
-     *
-     * <p>打开一张表时前端会同时请求「结构」和「数据」，两个请求都要拿这张表的结构；
-     * 没有这层合并的话，缓存冷启动时两个请求会各自跑一遍全库字典查询——恰好把要省的开销翻倍。
-     */
-    private final Map<String, CompletableFuture<TableInfo>> tableLoading = new ConcurrentHashMap<>();
-
-    /** 表缓存写入序号：超容量时按它淘汰最旧的条目。 */
-    private final AtomicLong tableCacheSeq = new AtomicLong();
+    private final SchemaCache<TableInfo> tableCache;
 
     /**
      * 抓快照专用线程池：固定大小 8，避免单次 batch 把 10 库全推到同瞬间连 DB。
@@ -98,6 +86,9 @@ public class SchemaService {
         this.executor = executor;
         this.registry = registry;
         this.props = props;
+        this.autocompleteCache = new SchemaCache<>(props::getSchemaCacheSeconds, 0);
+        this.snapshotCache = new SchemaCache<>(props::getSchemaCacheSeconds, 0);
+        this.tableCache = new SchemaCache<>(props::getTableCacheSeconds, Math.max(1, props.getTableCacheMaxEntries()));
     }
 
     /** 加载联想 schema；任何不可用情况返回 enabled=false（前端降级，不抛错）。force=true 时跳过缓存。 */
@@ -109,27 +100,29 @@ public class SchemaService {
         if (cid == null) {
             return SchemaResponse.disabled("未配置联想数据源或没有可用连接");
         }
-        if (!force) {
-            CacheEntry entry = cache.get(cid);
-            if (entry != null && !entry.isExpired()) {
-                log.info("[SchemaService] cache hit connectionId={} tables={}", cid, entry.data.getTables() == null ? 0 : entry.data.getTables().size());
-                return entry.data;
-            }
-        } else {
-            cache.remove(cid);
+        String cacheKey = String.valueOf(cid);
+        if (force) {
+            autocompleteCache.evict(cacheKey);
             log.info("[SchemaService] force reload connectionId={}", cid);
+        } else {
+            SchemaResponse cached = autocompleteCache.get(cacheKey);
+            if (cached != null) {
+                log.info("[SchemaService] cache hit connectionId={} tables={}", cid,
+                        cached.getTables() == null ? 0 : cached.getTables().size());
+                return cached;
+            }
         }
         try {
             DatabaseConnection conn = connections.get(cid);
             Dialect dialect = registry.get(conn.getDbType());
-            List<TableInfo> tables = loadTables(conn, dialect);
+            List<SchemaResponse.Table> tables = loadTables(conn, dialect);
 
             SchemaResponse resp = new SchemaResponse();
             resp.setEnabled(true);
             resp.setConnectionId(cid);
             resp.setDatabaseName(conn.getDatabaseName());
             resp.setTables(tables);
-            cache.put(cid, new CacheEntry(resp, System.currentTimeMillis() + props.getSchemaCacheSeconds() * 1000));
+            autocompleteCache.put(cacheKey, resp);
             log.info("[SchemaService] loaded connectionId={} db={} tables={}", cid, conn.getDatabaseName(), tables.size());
             return resp;
         } catch (Exception e) {
@@ -143,7 +136,7 @@ public class SchemaService {
      */
     public void evictAutocomplete(Long connectionId) {
         if (connectionId != null) {
-            cache.remove(connectionId);
+            autocompleteCache.evict(String.valueOf(connectionId));
         }
     }
 
@@ -154,7 +147,7 @@ public class SchemaService {
         if (connectionId == null) {
             return;
         }
-        tableCache.entrySet().removeIf(entry -> connectionId.equals(entry.getValue().connectionId));
+        tableCache.evictIf(entry -> belongsTo(connectionId, entry.key));
     }
 
     /**
@@ -168,27 +161,28 @@ public class SchemaService {
             return;
         }
         String name = table.trim();
-        if (tableCache.remove(tableKey(connectionId, name)) != null) {
-            log.info("[SchemaService] evict table connectionId={} table={}", connectionId, name);
-            return;
-        }
-        for (Map.Entry<String, TableEntry> entry : tableCache.entrySet()) {
-            TableEntry value = entry.getValue();
-            if (connectionId.equals(value.connectionId) && value.table.equalsIgnoreCase(name)) {
-                tableCache.remove(entry.getKey());
-                log.info("[SchemaService] evict table connectionId={} table={} (matched {})",
-                        connectionId, name, value.table);
-                return;
+        tableCache.evict(tableKey(connectionId, name));
+        String[] matched = new String[1];
+        tableCache.evictIf(entry -> {
+            if (belongsTo(connectionId, entry.key) && entry.value.getName().equalsIgnoreCase(name)) {
+                matched[0] = entry.value.getName();
+                return true;
             }
-        }
+            return false;
+        });
+        log.info("[SchemaService] evict table connectionId={} table={}{}", connectionId, name,
+                matched[0] == null ? "" : " (matched " + matched[0] + ")");
     }
 
     /**
-     * 整库缓存清理：联想 + 该连接全部单表结构缓存。
+     * 整库缓存清理：联想 + 整库快照 + 该连接全部单表结构缓存。
      */
     public void evict(Long connectionId) {
         evictAutocomplete(connectionId);
         evictTables(connectionId);
+        if (connectionId != null) {
+            snapshotCache.evict(String.valueOf(connectionId));
+        }
     }
 
     // ==================== 表浏览：单表结构（带缓存） ====================
@@ -211,36 +205,16 @@ public class SchemaService {
         if (connectionId == null) {
             throw new IllegalArgumentException("连接 id 为空");
         }
-        if (!force) {
-            TableInfo cached = cachedTable(connectionId, name);
-            if (cached != null) {
-                log.debug("[SchemaService] table cache hit connectionId={} table={}", connectionId, cached.getName());
-                return cached;
-            }
-        }
-        if (props.getTableCacheSeconds() == 0) {
-            // 缓存已关闭：直接查，不合并并发（保持「每次真查」的语义）
-            return loadTable(connectionId, name);
-        }
         String key = tableKey(connectionId, name);
-        CompletableFuture<TableInfo> mine = new CompletableFuture<>();
-        CompletableFuture<TableInfo> running = tableLoading.putIfAbsent(key, mine);
-        if (running != null) {
-            log.debug("[SchemaService] table load merged connectionId={} table={}", connectionId, name);
-            return awaitTable(running);
+        if (force) {
+            return tableCache.reload(key, () -> loadTable(connectionId, name));
         }
-        try {
-            TableInfo info = loadTable(connectionId, name);
-            rememberTable(key, connectionId, info);
-            mine.complete(info);
-            return info;
-        } catch (RuntimeException e) {
-            // 失败不写缓存：刚建好的表要能立刻打开
-            mine.completeExceptionally(e);
-            throw e;
-        } finally {
-            tableLoading.remove(key, mine);
+        TableInfo cached = cachedTable(connectionId, name);
+        if (cached != null) {
+            log.debug("[SchemaService] table cache hit connectionId={} table={}", connectionId, cached.getName());
+            return cached;
         }
+        return tableCache.getOrLoad(key, () -> loadTable(connectionId, name));
     }
 
     /** 查库拿单表结构（表不存在 / 快照失败都抛异常，不进缓存）。 */
@@ -258,40 +232,18 @@ public class SchemaService {
     }
 
     private TableInfo cachedTable(Long connectionId, String name) {
-        TableEntry exact = tableCache.get(tableKey(connectionId, name));
-        if (isFresh(exact)) {
-            return exact.data;
+        TableInfo exact = tableCache.get(tableKey(connectionId, name));
+        if (exact != null) {
+            return exact;
         }
         // 真实表名大小写可能不同（达梦/神通折叠成大写、MySQL 在 Linux 上区分大小写）。
         // 只在精确未命中时才做不敏感匹配：同一个库里「仅大小写不同」的两张表仍能精确区分。
-        for (TableEntry entry : tableCache.values()) {
-            if (connectionId.equals(entry.connectionId) && entry.table.equalsIgnoreCase(name) && isFresh(entry)) {
-                return entry.data;
+        for (SchemaCache.Entry<TableInfo> entry : tableCache.freshEntries()) {
+            if (belongsTo(connectionId, entry.key) && entry.value.getName().equalsIgnoreCase(name)) {
+                return entry.value;
             }
         }
         return null;
-    }
-
-    private boolean isFresh(TableEntry entry) {
-        if (entry == null) {
-            return false;
-        }
-        if (props.getTableCacheSeconds() == 0) {
-            return false;
-        }
-        return entry.expireAt < 0 || System.currentTimeMillis() <= entry.expireAt;
-    }
-
-    private void rememberTable(String key, Long connectionId, TableInfo info) {
-        long ttl = props.getTableCacheSeconds();
-        if (ttl == 0) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        long expireAt = ttl < 0 ? -1L : now + ttl * 1000L;
-        tableCache.put(key, new TableEntry(connectionId, info.getName(), info, expireAt, now,
-                tableCacheSeq.incrementAndGet()));
-        trimTableCache();
     }
 
     /**
@@ -304,49 +256,21 @@ public class SchemaService {
             return null;
         }
         String name = table.trim();
-        TableEntry exact = tableCache.get(tableKey(connectionId, name));
-        if (isFresh(exact)) {
-            return exact.capturedAt;
+        Long exact = tableCache.capturedAt(tableKey(connectionId, name));
+        if (exact != null) {
+            return exact;
         }
-        for (TableEntry entry : tableCache.values()) {
-            if (connectionId.equals(entry.connectionId) && entry.table.equalsIgnoreCase(name) && isFresh(entry)) {
+        for (SchemaCache.Entry<TableInfo> entry : tableCache.freshEntries()) {
+            if (belongsTo(connectionId, entry.key) && entry.value.getName().equalsIgnoreCase(name)) {
                 return entry.capturedAt;
             }
         }
         return null;
     }
 
-    /** 容量保护：超过上限时按写入顺序淘汰最旧的。只在超限时扫描（2000 条量级，成本可忽略）。 */
-    private void trimTableCache() {
-        int max = Math.max(1, props.getTableCacheMaxEntries());
-        while (tableCache.size() > max) {
-            String oldestKey = null;
-            long oldestSeq = Long.MAX_VALUE;
-            for (Map.Entry<String, TableEntry> entry : tableCache.entrySet()) {
-                if (entry.getValue().seq < oldestSeq) {
-                    oldestSeq = entry.getValue().seq;
-                    oldestKey = entry.getKey();
-                }
-            }
-            if (oldestKey == null || tableCache.remove(oldestKey) == null) {
-                return;
-            }
-            log.debug("[SchemaService] table cache evicted by capacity key={}", oldestKey);
-        }
-    }
-
-    private TableInfo awaitTable(CompletableFuture<TableInfo> future) {
-        try {
-            return future.join();
-        } catch (CompletionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException) {
-                throw (RuntimeException) cause;
-            }
-            throw e;
-        } catch (RuntimeException e) {
-            throw new IllegalStateException("表结构查询被中断: " + e.getMessage(), e);
-        }
+    /** key 形如 {@code connectionId:表名}，判前缀时不拼字符串，避免 1 命中 10。 */
+    private boolean belongsTo(Long connectionId, String key) {
+        return key.startsWith(connectionId + ":");
     }
 
     private String tableKey(Long connectionId, String table) {
@@ -424,10 +348,11 @@ public class SchemaService {
             return fail(null, null, "连接 id 为空");
         }
         boolean filtered = tableNames != null && !tableNames.isEmpty();
+        String cacheKey = String.valueOf(connectionId);
         if (!filtered && !force) {
-            SnapshotEntry entry = snapshotCache.get(connectionId);
-            if (entry != null && !entry.isExpired()) {
-                return entry.data;
+            SchemaSnapshot cached = snapshotCache.get(cacheKey);
+            if (cached != null) {
+                return cached;
             }
         }
         try {
@@ -450,8 +375,7 @@ public class SchemaService {
             } else {
                 List<TableInfo> tables = loadSnapshotTables(conn, dialect);
                 snap.setTables(tables);
-                snapshotCache.put(connectionId,
-                        new SnapshotEntry(snap, System.currentTimeMillis() + props.getSchemaCacheSeconds() * 1000L));
+                snapshotCache.put(cacheKey, snap);
                 log.info("[SchemaService] snapshot loaded connectionId={} db={} type={} tables={}",
                         connectionId, conn.getDatabaseName(), conn.getDbType(), tables.size());
             }
@@ -1138,57 +1062,82 @@ public class SchemaService {
     }
 
     /**
-     * 两步加载：先 information_schema.tables 拿清单（最多 maxTables 行），
-     * 再对每张表 information_schema.columns 拿列（最多 maxColumns 列）。
-     * 失败的单表日志 warn 但不影响其它表。
+     * 加载表名 + 列名：优先方言批量查询（1 条 SQL 拉全库列），失败或方言不支持时逐表查详情。
+     *
+     * <p>不能再用硬编码的 {@code information_schema}：达梦/神通没有这个 schema，
+     * 会逐表报错被 catch 吞掉，表现就是「联想只有表名、没有列」。
      */
-    private List<TableInfo> loadTables(DatabaseConnection conn, Dialect dialect) throws Exception {
+    private List<SchemaResponse.Table> loadTables(DatabaseConnection conn, Dialect dialect) throws Exception {
         String schema = dialect.schemaName(conn);
-        Map<String, TableInfo> byName = new LinkedHashMap<>();
-
-        String tablesSql = dialect.schemaTablesQuery();
-        log.info("[SchemaService] step1 tables sql={} schema={}", tablesSql, schema);
         // 用 executeRaw 避开 maxPageSize 对元数据查询的钳制（拿表名清单应一次拉全）
-        Map<String, Object> tableResult = executor.executeRaw(conn, tablesSql, Collections.singletonList(schema));
-        List<String> tableNames = readTableNames(tableResult);
-        log.info("[SchemaService] step1 got {} tables: {}", tableNames.size(),
-                tableNames.size() <= 10 ? tableNames : (tableNames.subList(0, 10) + "...(+" + (tableNames.size() - 10) + ")"));
+        List<String> tableNames = readTableNames(
+                executor.executeRaw(conn, dialect.schemaTablesQuery(), Collections.singletonList(schema)));
+        log.info("[SchemaService] step1 connectionId={} tables={} dbType={}",
+                conn.getId(), tableNames.size(), conn.getDbType());
 
-        String colsSql = "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position";
-        int colsLimit = Math.max(1, props.getMaxColumns());
+        Map<String, List<Map<?, ?>>> colRows = null;
+        String allColsSql = dialect.schemaAllColumnsQuery();
+        if (allColsSql != null) {
+            try {
+                colRows = groupRowsByTable(executor.executeRaw(conn, allColsSql, Collections.singletonList(schema)));
+            } catch (Exception e) {
+                log.warn("[SchemaService] 批量列查询失败将回退逐表 connectionId={}: {}", conn.getId(), e.getMessage());
+            }
+        }
+
+        List<SchemaResponse.Table> out = new ArrayList<>();
         int truncated = 0;
         for (String tableName : tableNames) {
-            if (byName.size() >= props.getMaxTables()) {
-                truncated += tableNames.size() - byName.size();
+            if (out.size() >= props.getMaxTables()) {
+                truncated += tableNames.size() - out.size();
                 break;
             }
             if (isSystemTable(tableName)) {
                 continue;
             }
-            try {
-                Map<String, Object> colResult = executor.executeRaw(conn, colsSql,
-                        Arrays.asList(schema, tableName));
-                TableInfo info = new TableInfo(tableName);
-                Object rowsObj = colResult.get("rows");
-                if (rowsObj instanceof List<?>) {
-                    for (Object rowObj : (List<?>) rowsObj) {
-                        if (!(rowObj instanceof Map)) continue;
-                        Map<?, ?> row = (Map<?, ?>) rowObj;
-                        String column = str(row, "column_name");
-                        String type = str(row, "data_type");
-                        if (column != null) info.getColumns().add(new ColumnInfo(column, type));
+            SchemaResponse.Table table = new SchemaResponse.Table(tableName);
+            List<Map<?, ?>> rows = colRows == null ? null : rowsOfTable(colRows, tableName);
+            if (rows != null) {
+                for (Map<?, ?> row : rows) {
+                    String column = str(row, "column_name");
+                    if (column != null) {
+                        table.getColumns().add(new SchemaResponse.Column(column));
                     }
                 }
-                byName.put(tableName, info);
-            } catch (Exception e) {
-                log.warn("[SchemaService] 表 {} 列元数据查询失败: {}", tableName, e.getMessage());
+            } else if (colRows == null) {
+                try {
+                    for (Map<?, ?> row : rowMaps(executor.executeRaw(conn, dialect.schemaColumnDetailQuery(),
+                            Arrays.asList(schema, tableName)))) {
+                        String column = str(row, "column_name");
+                        if (column != null) {
+                            table.getColumns().add(new SchemaResponse.Column(column));
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("[SchemaService] 表 {} 列名查询失败: {}", tableName, e.getMessage());
+                }
             }
+            out.add(table);
         }
         if (truncated > 0) {
             log.warn("[SchemaService] maxTables={} 截断，跳过 {} 张表", props.getMaxTables(), truncated);
         }
-        log.info("[SchemaService] step2 done total={} tables", byName.size());
-        return new ArrayList<>(byName.values());
+        log.info("[SchemaService] tables loaded total={} batched={}", out.size(), colRows != null);
+        return out;
+    }
+
+    /** 批量结果按字典里的真实表名分组，大小写与表清单不一致时兜底匹配。 */
+    private static List<Map<?, ?>> rowsOfTable(Map<String, List<Map<?, ?>>> byTable, String tableName) {
+        List<Map<?, ?>> exact = byTable.get(tableName);
+        if (exact != null) {
+            return exact;
+        }
+        for (Map.Entry<String, List<Map<?, ?>>> entry : byTable.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(tableName)) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 
     /** 从 information_schema.tables 查询结果里读取 table_name 列（不区分大小写）。 */
@@ -1224,55 +1173,6 @@ public class SchemaService {
             }
         }
         return null;
-    }
-
-    private static class CacheEntry {
-        final SchemaResponse data;
-        final long expireAt;
-
-        CacheEntry(SchemaResponse data, long expireAt) {
-            this.data = data;
-            this.expireAt = expireAt;
-        }
-
-        boolean isExpired() {
-            return System.currentTimeMillis() > expireAt;
-        }
-    }
-
-    private static class SnapshotEntry {
-        final SchemaSnapshot data;
-        final long expireAt;
-
-        SnapshotEntry(SchemaSnapshot data, long expireAt) {
-            this.data = data;
-            this.expireAt = expireAt;
-        }
-
-        boolean isExpired() {
-            return System.currentTimeMillis() > expireAt;
-        }
-    }
-
-    /** 单表结构缓存条目：expireAt < 0 表示永不过期（默认策略）。 */
-    private static class TableEntry {
-        final Long connectionId;
-        /** 库内真实表名（用户传的名字可能大小写不同）。 */
-        final String table;
-        final TableInfo data;
-        final long expireAt;
-        /** 抓取时间（展示「结构缓存于 xx」用）。 */
-        final long capturedAt;
-        final long seq;
-
-        TableEntry(Long connectionId, String table, TableInfo data, long expireAt, long capturedAt, long seq) {
-            this.connectionId = connectionId;
-            this.table = table;
-            this.data = data;
-            this.expireAt = expireAt;
-            this.capturedAt = capturedAt;
-            this.seq = seq;
-        }
     }
 
     /** 应用关闭时优雅释放快照线程池（最长等 5s）。 */

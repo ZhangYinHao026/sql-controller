@@ -1,5 +1,6 @@
 package com.sxwh.sqlcontroller.service;
 
+import com.sxwh.sqlcontroller.cache.SchemaCache;
 import com.sxwh.sqlcontroller.config.AutocompleteProperties;
 import com.sxwh.sqlcontroller.dialect.Dialect;
 import com.sxwh.sqlcontroller.dialect.DialectRegistry;
@@ -18,13 +19,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 线上连接的结构快照（字段对比用）：与本地 {@link SchemaService#snapshot} 同构的
@@ -58,8 +56,8 @@ public class OnlineSchemaService {
     private final DialectRegistry registry;
     private final AutocompleteProperties props;
 
-    /** 快照缓存：线上连接 id → (快照, 过期时间)，TTL 与本地快照一致（autocomplete.schema-cache-seconds）。 */
-    private final Map<Long, SnapshotEntry> cache = new ConcurrentHashMap<>();
+    /** 快照缓存：线上连接 id → SchemaSnapshot，TTL 与本地快照一致（autocomplete.schema-cache-seconds）。 */
+    private final SchemaCache<SchemaSnapshot> snapshotCache;
 
     /**
      * 表浏览「单表结构」缓存：{@code 连接id:表名} → 结构，与本地 {@link SchemaService} 同一套语义
@@ -67,13 +65,9 @@ public class OnlineSchemaService {
      *
      * <p>线上收益比本地更大：一次未命中就是 3 次小助手 HTTP 往返（索引 / 表注释 / 列详情），
      * 达梦区域整库字典还要翻页，单次数秒级。翻页时每页都重跑这套是不能接受的。
+     * 同 key 并发加载由缓存组件合并（打开表时前端会同时请求结构与数据）。
      */
-    private final Map<String, TableEntry> tableCache = new ConcurrentHashMap<>();
-
-    /** 同一张表的并发查询合并（打开表时前端会同时请求结构与数据）。 */
-    private final Map<String, CompletableFuture<TableInfo>> tableLoading = new ConcurrentHashMap<>();
-
-    private final AtomicLong tableCacheSeq = new AtomicLong();
+    private final SchemaCache<TableInfo> tableCache;
 
     private final ExecutorService executor = Executors.newFixedThreadPool(8, new ThreadFactory() {
         private final AtomicInteger seq = new AtomicInteger(1);
@@ -90,6 +84,8 @@ public class OnlineSchemaService {
         this.query = query;
         this.registry = registry;
         this.props = props;
+        this.snapshotCache = new SchemaCache<>(props::getSchemaCacheSeconds, 0);
+        this.tableCache = new SchemaCache<>(props::getTableCacheSeconds, Math.max(1, props.getTableCacheMaxEntries()));
     }
 
     /** 批量抓取（基准 + 比对库），并发 8，单库失败转 ok=false 不拖累其它库；返回顺序=入参顺序。 */
@@ -113,9 +109,10 @@ public class OnlineSchemaService {
     public SchemaSnapshot snapshot(Long connectionId, boolean force, List<String> tableNames) {
         if (connectionId == null) return fail(null, null, "连接 id 为空");
         boolean filtered = tableNames != null && !tableNames.isEmpty();
+        String cacheKey = String.valueOf(connectionId);
         if (!filtered && !force) {
-            SnapshotEntry entry = cache.get(connectionId);
-            if (entry != null && !entry.isExpired()) return entry.data;
+            SchemaSnapshot cached = snapshotCache.get(cacheKey);
+            if (cached != null) return cached;
         }
         OnlineConnection conn;
         try {
@@ -140,7 +137,7 @@ public class OnlineSchemaService {
                     : loadAll(conn, dialect, schemaExpr, mysql);
             snap.setTables(tables);
             if (!filtered) {
-                cache.put(connectionId, new SnapshotEntry(snap, System.currentTimeMillis() + props.getSchemaCacheSeconds() * 1000L));
+                snapshotCache.put(cacheKey, snap);
             }
             log.info("[online-schema] snapshot area={} {} type={} tables={} filtered={}",
                     conn.getAreaCode(), conn.getRegionName(), dbType, tables.size(), filtered);
@@ -169,34 +166,16 @@ public class OnlineSchemaService {
         if (connectionId == null) {
             throw new IllegalArgumentException("连接 id 为空");
         }
-        if (!force) {
-            TableInfo cached = cachedTable(connectionId, name);
-            if (cached != null) {
-                log.debug("[online-schema] table cache hit connectionId={} table={}", connectionId, cached.getName());
-                return cached;
-            }
-        }
-        if (props.getTableCacheSeconds() == 0) {
-            return loadTable(connectionId, name);
-        }
         String key = tableKey(connectionId, name);
-        CompletableFuture<TableInfo> mine = new CompletableFuture<>();
-        CompletableFuture<TableInfo> running = tableLoading.putIfAbsent(key, mine);
-        if (running != null) {
-            log.debug("[online-schema] table load merged connectionId={} table={}", connectionId, name);
-            return awaitTable(running);
+        if (force) {
+            return tableCache.reload(key, () -> loadTable(connectionId, name));
         }
-        try {
-            TableInfo info = loadTable(connectionId, name);
-            rememberTable(key, connectionId, info);
-            mine.complete(info);
-            return info;
-        } catch (RuntimeException e) {
-            mine.completeExceptionally(e);
-            throw e;
-        } finally {
-            tableLoading.remove(key, mine);
+        TableInfo cached = cachedTable(connectionId, name);
+        if (cached != null) {
+            log.debug("[online-schema] table cache hit connectionId={} table={}", connectionId, cached.getName());
+            return cached;
         }
+        return tableCache.getOrLoad(key, () -> loadTable(connectionId, name));
     }
 
     /** 精确清一张表的结构缓存（表级刷新 / 线上 DDL 成功后）。 */
@@ -205,19 +184,17 @@ public class OnlineSchemaService {
             return;
         }
         String name = table.trim();
-        if (tableCache.remove(tableKey(connectionId, name)) != null) {
-            log.info("[online-schema] evict table connectionId={} table={}", connectionId, name);
-            return;
-        }
-        for (Map.Entry<String, TableEntry> entry : tableCache.entrySet()) {
-            TableEntry value = entry.getValue();
-            if (connectionId.equals(value.connectionId) && value.table.equalsIgnoreCase(name)) {
-                tableCache.remove(entry.getKey());
-                log.info("[online-schema] evict table connectionId={} table={} (matched {})",
-                        connectionId, name, value.table);
-                return;
+        tableCache.evict(tableKey(connectionId, name));
+        String[] matched = new String[1];
+        tableCache.evictIf(entry -> {
+            if (belongsTo(connectionId, entry.key) && entry.value.getName().equalsIgnoreCase(name)) {
+                matched[0] = entry.value.getName();
+                return true;
             }
-        }
+            return false;
+        });
+        log.info("[online-schema] evict table connectionId={} table={}{}", connectionId, name,
+                matched[0] == null ? "" : " (matched " + matched[0] + ")");
     }
 
     /** 清掉某个线上连接的全部单表结构缓存（「重拉整库结构」）。 */
@@ -225,7 +202,7 @@ public class OnlineSchemaService {
         if (connectionId == null) {
             return;
         }
-        tableCache.entrySet().removeIf(entry -> connectionId.equals(entry.getValue().connectionId));
+        tableCache.evictIf(entry -> belongsTo(connectionId, entry.key));
     }
 
     /** 整库缓存清理：线上没有联想缓存，等价于 {@link #evictTables} + 整库快照。 */
@@ -233,7 +210,7 @@ public class OnlineSchemaService {
         if (connectionId == null) {
             return;
         }
-        cache.remove(connectionId);
+        snapshotCache.evict(String.valueOf(connectionId));
         evictTables(connectionId);
     }
 
@@ -285,38 +262,16 @@ public class OnlineSchemaService {
     }
 
     private TableInfo cachedTable(Long connectionId, String name) {
-        TableEntry exact = tableCache.get(tableKey(connectionId, name));
-        if (isFresh(exact)) {
-            return exact.data;
+        TableInfo exact = tableCache.get(tableKey(connectionId, name));
+        if (exact != null) {
+            return exact;
         }
-        for (TableEntry entry : tableCache.values()) {
-            if (connectionId.equals(entry.connectionId) && entry.table.equalsIgnoreCase(name) && isFresh(entry)) {
-                return entry.data;
+        for (SchemaCache.Entry<TableInfo> entry : tableCache.freshEntries()) {
+            if (belongsTo(connectionId, entry.key) && entry.value.getName().equalsIgnoreCase(name)) {
+                return entry.value;
             }
         }
         return null;
-    }
-
-    private boolean isFresh(TableEntry entry) {
-        if (entry == null) {
-            return false;
-        }
-        if (props.getTableCacheSeconds() == 0) {
-            return false;
-        }
-        return entry.expireAt < 0 || System.currentTimeMillis() <= entry.expireAt;
-    }
-
-    private void rememberTable(String key, Long connectionId, TableInfo info) {
-        long ttl = props.getTableCacheSeconds();
-        if (ttl == 0) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        long expireAt = ttl < 0 ? -1L : now + ttl * 1000L;
-        tableCache.put(key, new TableEntry(connectionId, info.getName(), info, expireAt, now,
-                tableCacheSeq.incrementAndGet()));
-        trimTableCache();
     }
 
     /** 这份线上结构的抓取时间（毫秒），未命中缓存返回 null。 */
@@ -325,47 +280,21 @@ public class OnlineSchemaService {
             return null;
         }
         String name = table.trim();
-        TableEntry exact = tableCache.get(tableKey(connectionId, name));
-        if (isFresh(exact)) {
-            return exact.capturedAt;
+        Long exact = tableCache.capturedAt(tableKey(connectionId, name));
+        if (exact != null) {
+            return exact;
         }
-        for (TableEntry entry : tableCache.values()) {
-            if (connectionId.equals(entry.connectionId) && entry.table.equalsIgnoreCase(name) && isFresh(entry)) {
+        for (SchemaCache.Entry<TableInfo> entry : tableCache.freshEntries()) {
+            if (belongsTo(connectionId, entry.key) && entry.value.getName().equalsIgnoreCase(name)) {
                 return entry.capturedAt;
             }
         }
         return null;
     }
 
-    private void trimTableCache() {
-        int max = Math.max(1, props.getTableCacheMaxEntries());
-        while (tableCache.size() > max) {
-            String oldestKey = null;
-            long oldestSeq = Long.MAX_VALUE;
-            for (Map.Entry<String, TableEntry> entry : tableCache.entrySet()) {
-                if (entry.getValue().seq < oldestSeq) {
-                    oldestSeq = entry.getValue().seq;
-                    oldestKey = entry.getKey();
-                }
-            }
-            if (oldestKey == null || tableCache.remove(oldestKey) == null) {
-                return;
-            }
-        }
-    }
-
-    private TableInfo awaitTable(CompletableFuture<TableInfo> future) {
-        try {
-            return future.join();
-        } catch (CompletionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException) {
-                throw (RuntimeException) cause;
-            }
-            throw e;
-        } catch (RuntimeException e) {
-            throw new IllegalStateException("线上表结构查询被中断: " + e.getMessage(), e);
-        }
+    /** key 形如 {@code connectionId:表名}，判前缀时不拼字符串，避免 1 命中 10。 */
+    private boolean belongsTo(Long connectionId, String key) {
+        return key.startsWith(connectionId + ":");
     }
 
     private String tableKey(Long connectionId, String table) {
@@ -619,41 +548,6 @@ public class OnlineSchemaService {
     private static String msg(Throwable e) {
         String m = e.getMessage();
         return m == null || m.trim().isEmpty() ? e.getClass().getSimpleName() : m;
-    }
-
-    private static class SnapshotEntry {
-        final SchemaSnapshot data;
-        final long expireAt;
-
-        SnapshotEntry(SchemaSnapshot data, long expireAt) {
-            this.data = data;
-            this.expireAt = expireAt;
-        }
-
-        boolean isExpired() {
-            return System.currentTimeMillis() > expireAt;
-        }
-    }
-
-    /** 单表结构缓存条目：expireAt < 0 表示永不过期（默认策略）。 */
-    private static class TableEntry {
-        final Long connectionId;
-        /** 库内真实表名（用户传的名字可能大小写不同）。 */
-        final String table;
-        final TableInfo data;
-        final long expireAt;
-        /** 抓取时间（展示「结构缓存于 xx」用）。 */
-        final long capturedAt;
-        final long seq;
-
-        TableEntry(Long connectionId, String table, TableInfo data, long expireAt, long capturedAt, long seq) {
-            this.connectionId = connectionId;
-            this.table = table;
-            this.data = data;
-            this.expireAt = expireAt;
-            this.capturedAt = capturedAt;
-            this.seq = seq;
-        }
     }
 
     @javax.annotation.PreDestroy

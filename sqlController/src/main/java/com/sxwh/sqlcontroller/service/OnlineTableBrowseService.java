@@ -1,5 +1,6 @@
 package com.sxwh.sqlcontroller.service;
 
+import com.sxwh.sqlcontroller.cache.SchemaCache;
 import com.sxwh.sqlcontroller.config.AutocompleteProperties;
 import com.sxwh.sqlcontroller.config.OnlineProperties;
 import com.sxwh.sqlcontroller.config.SqlControllerProperties;
@@ -26,7 +27,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 线上（生产）表浏览：把「点表看数据 / 看结构」做成与本地一致的体验。
@@ -64,8 +64,8 @@ public class OnlineTableBrowseService {
     private final HistoryRepository history;
     private final AutocompleteProperties props;
 
-    /** 表清单缓存：连接 id → (全量清单, 过期时间)，TTL 与单表结构一致（默认永不过期）。 */
-    private final Map<Long, TableListEntry> listCache = new ConcurrentHashMap<>();
+    /** 表清单缓存：连接 id → 全量清单，TTL 与单表结构一致（默认永不过期）。 */
+    private final SchemaCache<List<Map<String, Object>>> listCache;
 
     public OnlineTableBrowseService(OnlineConnectionService connections, OnlineSchemaService schemas,
                                     OnlineQueryService query, OnlineWriteService writer, TableBrowseService browse,
@@ -82,6 +82,7 @@ public class OnlineTableBrowseService {
         this.onlineProperties = onlineProperties;
         this.history = history;
         this.props = props;
+        this.listCache = new SchemaCache<>(props::getTableCacheSeconds, Math.max(1, props.getTableCacheMaxEntries()));
     }
 
     // ==================== 表清单 ====================
@@ -110,19 +111,8 @@ public class OnlineTableBrowseService {
 
     /** 取整份清单：命中缓存直接返回，未命中才真查并回填。 */
     private List<Map<String, Object>> cachedTableList(Long connectionId, OnlineConnection conn) {
-        long ttl = props.getTableCacheSeconds();
-        if (ttl != 0) {
-            TableListEntry entry = listCache.get(connectionId);
-            if (entry != null && (entry.expireAt < 0 || System.currentTimeMillis() <= entry.expireAt)) {
-                return entry.data;
-            }
-        }
-        List<Map<String, Object>> list = Collections.unmodifiableList(loadAllTables(conn));
-        if (ttl != 0) {
-            listCache.put(connectionId, new TableListEntry(list,
-                    ttl < 0 ? -1L : System.currentTimeMillis() + ttl * 1000L));
-        }
-        return list;
+        return listCache.getOrLoad(String.valueOf(connectionId),
+                () -> Collections.unmodifiableList(loadAllTables(conn)));
     }
 
     /** 真查整份清单：MySQL 翻页取全（不翻页会把 300 张表以后的清单静默截断），其余方言走整库快照。 */
@@ -534,7 +524,7 @@ public class OnlineTableBrowseService {
     /** 只清表清单缓存：线上建/删表后要重拉清单，但不必重拉已缓存的结构。 */
     public void evictTableList(Long connectionId) {
         if (connectionId != null) {
-            listCache.remove(connectionId);
+            listCache.evict(String.valueOf(connectionId));
         }
     }
 
@@ -698,16 +688,5 @@ public class OnlineTableBrowseService {
     /** 结构快照里的索引（保留给后续「线上索引编辑」复用）。 */
     public List<IndexInfo> indexesOf(TableInfo table) {
         return table == null ? Collections.emptyList() : table.getIndexes();
-    }
-
-    /** 表清单缓存条目：expireAt < 0 表示永不过期（与单表结构缓存同一套语义）。 */
-    private static class TableListEntry {
-        final List<Map<String, Object>> data;
-        final long expireAt;
-
-        TableListEntry(List<Map<String, Object>> data, long expireAt) {
-            this.data = data;
-            this.expireAt = expireAt;
-        }
     }
 }
