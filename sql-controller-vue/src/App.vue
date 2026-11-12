@@ -10,7 +10,7 @@ import HistoryDialog from './components/HistoryDialog.vue'
 import CommandSidebar from './components/CommandSidebar.vue'
 import { DB_REGISTRY, typeLabel } from './utils/dbRegistry'
 import { assembleStatements } from './utils/sqlStatements'
-import { onlineSqlInfo } from './utils/onlineSql'
+import { onlineSqlInfo, onlineHead, ONLINE_READ_HEADS, splitOnlineStatements } from './utils/onlineSql'
 import { currentTheme, toggleTheme } from './utils/theme'
 import ConvertDialog from './components/ConvertDialog.vue'
 import SchemaDiffDialog from './components/SchemaDiffDialog.vue'
@@ -40,7 +40,7 @@ const elapsed = ref(0), cancelling = ref(false)
 let timerHandle = null
 let currentAbort = null
 let currentRequestId = null
-const confirm = reactive({show: false, sql: '', targets: [], action: null, warnings: []})
+const confirm = reactive({show: false, sql: '', targets: [], action: null, warnings: [], warningsTitle: ''})
 // batch：上次执行是否为「一键转换并执行」的全类型批量（各库方言不同，全局翻页无统一 SQL）
 const lastExecution = reactive({sql: '', mode: 'ALL', confirmed: false, scriptNodeId: null, params: {}, batch: false})
 const cardPages = reactive({})
@@ -241,38 +241,92 @@ function startExecute(selectedSql, script = null) {
   const mode = selectedSql ? 'SELECTED' : 'ALL';
   const run = confirmed => execute(value, mode, confirmed, true, script);
   if (isRisky(value)) {
-    Object.assign(confirm, {show: true, sql: value, targets: selectedConnections.value, warnings: [], action: () => run(true)})
+    Object.assign(confirm, {show: true, sql: value, targets: selectedConnections.value, warnings: [], warningsTitle: '', action: () => run(true)})
   } else run(false)
 }
 
 /**
- * 线上执行入口：按首词分两条通道。
- * - 只读（SELECT/SHOW/DESC/EXPLAIN/WITH）→ 远程查询小助手，多区域并行；
- * - 写入（UPDATE/INSERT/REPLACE）→ 各省 updateSql，强制单区域 + 二次确认。
- * 末尾分号由后端自动去掉（此处不拦），多语句在此提前拦下并说明。
+ * 线上执行入口：支持多区域 + 多语句。
+ * - 语句拆分后逐条下发（线上每个请求只收一条语句）；区域内语句串行，区域间并行；
+ * - 每条语句按首词选通道：只读（SELECT/SHOW/DESC/EXPLAIN/WITH）→ 查询通道，其余 → 写入通道；
+ * - 单条失败即停该区域，其它区域继续；含写入/DDL/DELETE 时强制二次确认。
+ * 末尾分号由后端自动去掉（此处不拦）。
  */
 function startExecuteOnline(value) {
   if (!onlineSelectedIds.value.length) return toast('至少选择一个线上区域');
-  const info = onlineSqlInfo(value)
-  if (info.empty) return toast('请输入 SQL')
-  if (info.count > 1) return toast(info.error)
-  const writeIntent = info.write || info.delete || info.ddl
-  if (writeIntent) {
-    if (onlineSelectedIds.value.length > 1) return toast('线上修改只能选择 1 个区域')
+  const statements = splitOnlineStatements(value)
+  if (!statements.length) return toast('请输入 SQL')
+  const heads = statements.map(s => onlineHead(s))
+  const hasWrite = heads.some(h => !ONLINE_READ_HEADS.includes(h))
+  const regions = selectedOnlineConnections.value
+  if (hasWrite) {
     if (!onlineStatus.value?.writeEnabled) return toast('服务端未配置加密方式（中心加密接口地址/密钥），写入通道未启用')
-    const warn = info.ddl
-      ? 'DDL 会直接改动线上表结构，不可撤销，请确认 SQL 与目标区域无误'
-      : info.delete
-        ? 'DELETE 会直接删除线上生产数据，不可撤销，请确认 SQL 与目标区域无误'
-        : '线上生产数据，修改不可撤销，请确认 SQL 与目标区域无误'
+    // 不再展示 DDL/DELETE 的风险文案：确认框只列 SQL 与目标区域
     Object.assign(confirm, {
-      show: true, sql: info.text, targets: selectedOnlineConnections.value,
-      warnings: [warn],
-      action: () => executeOnline(info.text, true, true)
+      show: true, sql: statements.join(';\n'), targets: regions,
+      warnings: [], warningsTitle: '',
+      action: () => runOnlineUnits(regions.map(r => ({region: r, statements})))
     })
     return
   }
-  executeOnline(info.text, false, false)
+  runOnlineUnits(regions.map(r => ({region: r, statements})))
+}
+
+// 线上批量执行：多区域 × 各自的多条语句。区域内语句串行，区域间并行；单条失败即停该区域，其它区域继续。
+// 每条语句按首词选通道：只读走查询通道，其余走写入通道（单区域）。
+async function runOnlineUnits(units) {
+  loading.value = true
+  error.value = ''
+  activeTab.value = 'result'
+  page.value = 1
+  lastExecution.sql = ''
+  lastExecution.mode = 'ONLINE'
+  lastExecution.confirmed = true
+  lastExecution.scriptNodeId = null
+  lastExecution.params = {}
+  lastExecution.batch = true
+  results.value = []
+  Object.keys(cardPages).forEach(k => delete cardPages[k])
+  Object.keys(cardSql).forEach(k => delete cardSql[k])
+  const failures = []
+  let okCount = 0
+  startTimer()
+  try {
+    await Promise.all(units.map(async unit => {
+      for (const stmt of unit.statements) {
+        const isRead = ONLINE_READ_HEADS.includes(onlineHead(stmt))
+        try {
+          const data = isRead
+            ? await api.onlineQuery({
+              connectionIds: [unit.region.id], sql: stmt, page: 1,
+              pageSize: pagination.value ? Number(pageSize.value) : 100, requestId: requestId()
+            })
+            : await api.onlineWrite({connectionId: unit.region.id, sql: stmt, confirmed: true})
+          const list = data?.results || []
+          results.value = [...results.value, ...list]
+          list.forEach(item => { cardPages[item.connectionId] = 1; cardSql[item.connectionId] = stmt })
+          logs.value.unshift(...list.map(item => ({
+            ...item, sql: stmt, time: new Date().toLocaleString('zh-CN', {hour12: false})
+          })))
+          const failed = list.filter(i => i.status === 'FAILED')
+          failed.forEach(i => failures.push(`${i.regionName}: ${i.errorMessage}`))
+          if (failed.length) break      // 该区域后续语句不再执行
+          okCount++
+        } catch (e) {
+          failures.push(`${unit.region.regionName}: ${e.message}`)
+          break
+        }
+      }
+    }))
+    if (failures.length) {
+      error.value = failures.join('\n')
+      activeTab.value = 'errors'
+    }
+    toast(`线上批量执行完成：${okCount} 条成功${failures.length ? `，${failures.length} 项失败` : ''}`)
+  } finally {
+    stopTimer()
+    loading.value = false
+  }
 }
 
 /** 线上执行（查询 / 写入共用结果结构，直接复用结果卡片渲染）。 */
@@ -343,7 +397,7 @@ function runConverted(payload) {
   const run = confirmed => execute(value, mode, confirmed, true, null)
   if (isRisky(value)) {
     // 危险 SQL：确认框内必须能看到转换告警（被跳过的语句不在脚本里）
-    Object.assign(confirm, {show: true, sql: value, targets: selectedConnections.value, warnings: warnings || [], action: () => run(true)})
+    Object.assign(confirm, {show: true, sql: value, targets: selectedConnections.value, warnings: warnings || [], warningsTitle: '⚠ 转换告警：以下语句转换时被跳过，未包含在待执行脚本中', action: () => run(true)})
   } else {
     if (warnings?.length) toast(`注意：转换中 ${warnings.length} 条语句被跳过（详见弹窗内告警）`)
     run(false)
@@ -368,11 +422,11 @@ async function convertForType(rawSql, type) {
   return {text, warnings: (conv?.warnings || []).map(w => `${typeLabel(type)}：${w}`)}
 }
 
-// 「一键转换并执行」：把 MySQL 源 SQL 转成各方言后，对**全部连接按类型分组**逐一执行。
-// 与「▶ 执行」的区别：忽略目标方言勾选、覆盖所有类型（含 mysql 用原始 SQL），结果回主界面结果卡片。
+// 「一键转换并执行」入口：target=local 走全类型分组批量执行；target=online 走线上区域执行
 async function runConvertedAll(payload) {
   const rawSql = (payload?.sql || '').trim()
   if (!rawSql) return toast('请输入要转换的 SQL')
+  if (payload?.target === 'online') return runConvertedAllOnline(rawSql, payload.onlineIds || [])
   if (!connections.value.length) return toast('当前没有任何数据库连接，请先到设置中添加')
   dialogs.convert = false      // 关弹窗：进度与结果都在主界面看
   sql.value = rawSql           // 回填编辑器，便于核对 / 复用原始 SQL
@@ -413,10 +467,126 @@ async function runConvertedAll(payload) {
   // 4) 危险 SQL 沿用现有二次确认；目标列出全部待执行库，并把转换告警一并透出
   const targets = connections.value.filter(conn => plan.some(p => p.dbType === conn.dbType))
   if (isRisky(rawSql)) {
-    Object.assign(confirm, {show: true, sql: rawSql, targets, warnings, action: () => executeBatch(plan, true, skipped)})
+    Object.assign(confirm, {show: true, sql: rawSql, targets, warnings, warningsTitle: '⚠ 转换告警：以下语句转换时被跳过，未包含在待执行脚本中', action: () => executeBatch(plan, true, skipped)})
   } else {
     executeBatch(plan, false, skipped)
   }
+}
+
+/* ---------------- 一键转换并执行到线上：按勾选区域转方言执行 ---------------- */
+
+// 规则：
+// - 只读语句：多区域并行走查询通道，按库型分组转换（每组一次请求、组内多条语句串行）；
+// - 写入/DDL：多区域并行、区域内多条语句逐条串行，单条失败即停该区域（其它区域继续），
+//   需写入通道已启用 + 强制二次确认（确认框列出全部目标区域）。
+async function runConvertedAllOnline(rawSql, ids) {
+  const regions = currentOnlineConnections.value.filter(r => ids.includes(r.id))
+  if (!regions.length) return toast('请至少勾选一个线上区域')
+  const isRead = ONLINE_READ_HEADS.includes(onlineHead(rawSql))
+  if (!isRead && !onlineStatus.value?.writeEnabled) return toast('服务端写入通道未启用，无法执行写入类语句')
+  dialogs.convert = false
+  sql.value = rawSql           // 回填编辑器，便于核对 / 复用原始 SQL
+  // 按库型分组转换（mysql 用原始 SQL）；某库型转换失败 → 该组区域整体跳过
+  const converted = new Map()
+  const skipped = []
+  const warnings = []
+  const types = [...new Set(regions.map(r => r.dbType || 'unknown'))]
+  await Promise.all(types.map(async type => {
+    try {
+      const {text, warnings: ws} = type === 'mysql'
+        ? {text: rawSql, warnings: []}
+        : await convertForType(rawSql, type)
+      converted.set(type, text)
+      warnings.push(...ws)
+    } catch (e) {
+      skipped.push(`${typeLabel(type)} 组已跳过：${e.message}`)
+    }
+  }))
+  const ok = regions.filter(r => converted.has(r.dbType || 'unknown'))
+  if (!ok.length) return toast(`没有可执行的目标（${skipped.join('；') || '转换失败'}）`)
+  if (skipped.length) toast(`部分区域已跳过：${skipped.join('；')}`)
+  if (isRead) {
+    if (warnings.length) toast(`注意：转换中 ${warnings.length} 条语句被跳过`)
+    const groups = [...new Set(ok.map(r => r.dbType || 'unknown'))].map(type => ({
+      dbType: type,
+      ids: ok.filter(r => (r.dbType || 'unknown') === type).map(r => r.id),
+      statements: splitOnlineStatements(converted.get(type))
+    }))
+    await runOnlineReadGroups(groups)
+  } else {
+    // 每个区域用自己的方言转换结果，逐条串行；区域间并行，单条失败即停该区域
+    const units = ok.map(r => ({
+      region: r,
+      statements: splitOnlineStatements(converted.get(r.dbType || 'unknown'))
+    }))
+    runOnlineWriteConfirm(units, warnings)
+  }
+}
+
+// 线上只读批量：组间并行、组内逐条语句串行（线上每个请求只收一条语句），结果累加展示
+async function runOnlineReadGroups(groups) {
+  loading.value = true
+  error.value = ''
+  activeTab.value = 'result'
+  page.value = 1
+  lastExecution.sql = ''
+  lastExecution.mode = 'ONLINE'
+  lastExecution.confirmed = false
+  lastExecution.scriptNodeId = null
+  lastExecution.params = {}
+  lastExecution.batch = true
+  results.value = []
+  Object.keys(cardPages).forEach(k => delete cardPages[k])
+  Object.keys(cardSql).forEach(k => delete cardSql[k])
+  const failures = []
+  let okCount = 0
+  const totalCount = groups.reduce((s, g) => s + g.ids.length, 0)
+  startTimer()
+  try {
+    await Promise.all(groups.map(async g => {
+      for (const stmt of g.statements) {
+        try {
+          const data = await api.onlineQuery({
+            connectionIds: g.ids, sql: stmt, page: 1,
+            pageSize: pagination.value ? Number(pageSize.value) : 100, requestId: requestId()
+          })
+          const list = data?.results || []
+          results.value = [...results.value, ...list]
+          list.forEach(item => { cardPages[item.connectionId] = 1; cardSql[item.connectionId] = stmt })
+          logs.value.unshift(...list.map(item => ({
+            ...item, sql: stmt, time: new Date().toLocaleString('zh-CN', {hour12: false})
+          })))
+          okCount += Number(data?.successConnections || 0)
+          list.filter(i => i.status === 'FAILED').forEach(i => failures.push(`${i.regionName}: ${i.errorMessage}`))
+        } catch (e) {
+          failures.push(`${typeLabel(g.dbType)} 组执行失败：${e.message}`)
+          break    // 该组后续语句不再执行，其它组继续
+        }
+      }
+    }))
+    if (failures.length) {
+      error.value = failures.join('\n')
+      activeTab.value = 'errors'
+    }
+    toast(`线上批量查询完成：${okCount}/${totalCount} 个区域成功`)
+  } finally {
+    stopTimer()
+    loading.value = false
+  }
+}
+
+// 线上写入：强制二次确认（线上生产一律确认，确认框列出全部目标区域）；
+// 确认后多区域并行、区域内逐条串行，单条失败即停该区域（其它区域继续）。
+function runOnlineWriteConfirm(units, warnings) {
+  if (units.some(u => !u.statements.length)) return toast('部分区域转换后无可用语句，请检查转换结果')
+  Object.assign(confirm, {
+    show: true,
+    sql: units.map(u => u.statements.join(';\n')).join(';\n\n'),
+    targets: units.map(u => ({...u.region, regionName: `${u.region.regionName}（线上）`})),
+    warnings: [...warnings],
+    warningsTitle: '⚠ 转换告警：以下语句转换时被跳过，未包含在待执行脚本中',
+    action: () => runOnlineUnits(units)
+  })
 }
 
 // 全类型批量执行：后端禁止单请求混选不同 dbType → 逐组串行下发，结果累加展示。
@@ -583,7 +753,7 @@ async function runDiffScript(payload) {
     notifyDiff(res)
   }
   if (isRisky(text)) {
-    Object.assign(confirm, {show: true, sql: text, targets: [conn], warnings, action: () => finish(true)})
+    Object.assign(confirm, {show: true, sql: text, targets: [conn], warnings, warningsTitle: '⚠ 转换告警：以下语句转换时被跳过，未包含在待执行脚本中', action: () => finish(true)})
   } else {
     if (warnings.length) toast(`注意：转换中 ${warnings.length} 条语句被跳过（详见弹窗内告警）`)
     finish(false)
@@ -1083,7 +1253,8 @@ onMounted(async () => {
     <TableWorkspace v-if="activeTable" :key="activeTable.key" :tab="activeTable" />
     </div>
   </main>
-  <ConfirmDialog :show="confirm.show" :sql="confirm.sql" :targets="confirm.targets" :warnings="confirm.warnings" @confirm="confirmExecute"
+  <ConfirmDialog :show="confirm.show" :sql="confirm.sql" :targets="confirm.targets" :warnings="confirm.warnings"
+                 :warnings-title="confirm.warningsTitle" @confirm="confirmExecute"
                  @cancel="cancelConfirm"/>
   <ConfirmDialog mode="generic" title="删除数据库连接"
                  :message="pendingDelete ? `确定删除 “${pendingDelete.regionName}” 连接吗？此操作不可恢复。` : ''"
@@ -1115,7 +1286,10 @@ onMounted(async () => {
                  :filter="historyKind" :counts="historyCounts"
                  @close="dialogs.history = false" @page="loadHistory" @page-size-change="changeHistoryPageSize"
                  @filter="changeHistoryKind"/>
-  <ConvertDialog :show="dialogs.convert" :connections="connections" @close="dialogs.convert = false" @use-result="runConverted" @execute-all="runConvertedAll"/>
+  <ConvertDialog :show="dialogs.convert" :connections="connections"
+                 :online-regions="currentOnlineConnections" :online-preselected="onlineSelectedIds"
+                 :online-write-enabled="!!onlineStatus?.writeEnabled"
+                 @close="dialogs.convert = false" @use-result="runConverted" @execute-all="runConvertedAll"/>
   <SchemaDiffDialog :show="dialogs.diff" :connections="connections" :online-connections="onlineConnections"
                     @close="dialogs.diff = false" @run="runDiffScript" @toast="toast"/>
   <div v-if="notice" class="toast">{{ notice }}</div>

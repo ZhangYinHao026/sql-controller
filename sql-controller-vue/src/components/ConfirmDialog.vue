@@ -9,7 +9,8 @@ defineProps({
   confirmText: { type: String, default: '' },
   cancelText: { type: String, default: '取消' },
   danger: { type: Boolean, default: true },
-  warnings: { type: Array, default: () => [] }   // 转换告警：执行前提示被跳过的语句
+  warnings: { type: Array, default: () => [] },  // 转换告警 / 风险提示：执行前提示被跳过的语句或风险
+  warningsTitle: { type: String, default: '' }   // 告警区标题；不传则用中性的「提示（N 条）」
 })
 defineEmits(['confirm', 'cancel'])
 </script>
@@ -21,9 +22,8 @@ defineEmits(['confirm', 'cancel'])
         <button class="icon-btn" @click="$emit('cancel')">×</button>
       </header>
       <p v-if="message" :class="danger ? 'risk' : ''">{{ message }}</p>
-      <p v-else-if="mode === 'sql'" class="risk">该操作可能修改或删除所选数据库中的数据，请确认 SQL 内容无误。</p>
       <div v-if="mode === 'sql' && warnings.length" class="warn-strip">
-        <div class="warn-title">⚠ 转换告警：以下 {{ warnings.length }} 条语句转换时被跳过，未包含在待执行脚本中</div>
+        <div class="warn-title">{{ warningsTitle || `⚠ 提示（${warnings.length} 条）` }}</div>
         <ul><li v-for="(w, i) in warnings" :key="i">{{ w }}</li></ul>
       </div>
       <div v-if="mode === 'sql'" class="sql-preview">目标：{{ targets.map(item => item.regionName).join('、') }}{{ '\n\n' }}{{ sql }}</div>

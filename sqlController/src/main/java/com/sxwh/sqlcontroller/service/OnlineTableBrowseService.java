@@ -1,5 +1,6 @@
 package com.sxwh.sqlcontroller.service;
 
+import com.sxwh.sqlcontroller.config.AutocompleteProperties;
 import com.sxwh.sqlcontroller.config.OnlineProperties;
 import com.sxwh.sqlcontroller.config.SqlControllerProperties;
 import com.sxwh.sqlcontroller.dialect.Dialect;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 线上（生产）表浏览：把「点表看数据 / 看结构」做成与本地一致的体验。
@@ -48,6 +50,8 @@ public class OnlineTableBrowseService {
     private static final int MAX_EXPORT_ROWS = 5000;
     /** 线上导出单页大小：部分区域小助手限制 pagesize ≤ 300，取 300 保证跨区域可用。 */
     private static final int EXPORT_PAGE_SIZE = 300;
+    /** 表清单翻页保护：单次清单最多翻这么多页（300 × 100 = 3 万张表）。 */
+    private static final int MAX_LIST_PAGES = 100;
 
     private final OnlineConnectionService connections;
     private final OnlineSchemaService schemas;
@@ -58,11 +62,16 @@ public class OnlineTableBrowseService {
     private final SqlControllerProperties properties;
     private final OnlineProperties onlineProperties;
     private final HistoryRepository history;
+    private final AutocompleteProperties props;
+
+    /** 表清单缓存：连接 id → (全量清单, 过期时间)，TTL 与单表结构一致（默认永不过期）。 */
+    private final Map<Long, TableListEntry> listCache = new ConcurrentHashMap<>();
 
     public OnlineTableBrowseService(OnlineConnectionService connections, OnlineSchemaService schemas,
                                     OnlineQueryService query, OnlineWriteService writer, TableBrowseService browse,
                                     DialectRegistry dialects, SqlControllerProperties properties,
-                                    OnlineProperties onlineProperties, HistoryRepository history) {
+                                    OnlineProperties onlineProperties, HistoryRepository history,
+                                    AutocompleteProperties props) {
         this.connections = connections;
         this.schemas = schemas;
         this.query = query;
@@ -72,37 +81,78 @@ public class OnlineTableBrowseService {
         this.properties = properties;
         this.onlineProperties = onlineProperties;
         this.history = history;
+        this.props = props;
     }
 
     // ==================== 表清单 ====================
 
     /**
      * 轻量表清单。线上区域混着 MySQL / 达梦 / 神通三种库：
-     * MySQL 走 information_schema 一次拿全（快）；其余方言退回结构快照（首次慢、之后 24h 缓存）。
+     * MySQL 走 information_schema 翻页拿全（一次往返几百毫秒）；其余方言退回结构快照（首次慢、之后 24h 缓存）。
+     *
+     * <p>清单按连接整份缓存（TTL 与单表结构一致，默认永不过期），keyword 只过滤缓存结果。
      */
     public List<Map<String, Object>> tables(Long connectionId, String keyword) {
         OnlineConnection conn = requireConnection(connectionId);
+        List<Map<String, Object>> all = cachedTableList(connectionId, conn);
         String kw = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
+        if (kw.isEmpty()) {
+            return all;
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map<String, Object> item : all) {
+            if (match(String.valueOf(item.get("name")), kw)) {
+                out.add(item);
+            }
+        }
+        return out;
+    }
+
+    /** 取整份清单：命中缓存直接返回，未命中才真查并回填。 */
+    private List<Map<String, Object>> cachedTableList(Long connectionId, OnlineConnection conn) {
+        long ttl = props.getTableCacheSeconds();
+        if (ttl != 0) {
+            TableListEntry entry = listCache.get(connectionId);
+            if (entry != null && (entry.expireAt < 0 || System.currentTimeMillis() <= entry.expireAt)) {
+                return entry.data;
+            }
+        }
+        List<Map<String, Object>> list = Collections.unmodifiableList(loadAllTables(conn));
+        if (ttl != 0) {
+            listCache.put(connectionId, new TableListEntry(list,
+                    ttl < 0 ? -1L : System.currentTimeMillis() + ttl * 1000L));
+        }
+        return list;
+    }
+
+    /** 真查整份清单：MySQL 翻页取全（不翻页会把 300 张表以后的清单静默截断），其余方言走整库快照。 */
+    private List<Map<String, Object>> loadAllTables(OnlineConnection conn) {
         List<Map<String, Object>> out = new ArrayList<>();
         boolean light = isMysql(conn);
         if (light) {
             try {
                 String sql = "SELECT table_name AS tableName, table_comment AS tableComment FROM information_schema.tables "
                         + "WHERE table_schema = database() AND table_type = 'BASE TABLE' ORDER BY table_name";
-                OnlineQueryService.Rows rows = query.selectRows(conn, sql, 1, EXPORT_PAGE_SIZE);
-                for (Map<String, Object> row : rows.rows) {
-                    String name = text(row.get("tableName"));
-                    if (name == null) {
-                        name = text(row.get("table_name"));
+                int page = 1;
+                int pages = 1;
+                do {
+                    OnlineQueryService.Rows rows = query.selectRows(conn, sql, page, EXPORT_PAGE_SIZE);
+                    for (Map<String, Object> row : rows.rows) {
+                        String name = text(row.get("tableName"));
+                        if (name == null) {
+                            name = text(row.get("table_name"));
+                        }
+                        if (name == null) {
+                            continue;
+                        }
+                        Map<String, Object> item = new LinkedHashMap<>();
+                        item.put("name", name);
+                        item.put("comment", text(row.get("tableComment")));
+                        out.add(item);
                     }
-                    if (name == null || !match(name, kw)) {
-                        continue;
-                    }
-                    Map<String, Object> item = new LinkedHashMap<>();
-                    item.put("name", name);
-                    item.put("comment", text(row.get("tableComment")));
-                    out.add(item);
-                }
+                    pages = Math.min(Math.max(1, rows.pageCount), MAX_LIST_PAGES);
+                    page++;
+                } while (page <= pages);
             } catch (Exception e) {
                 log.warn("[online-browse] information_schema 表清单失败，回退结构快照 area={} {}: {}",
                         conn.getAreaCode(), conn.getRegionName(), e.getMessage());
@@ -111,14 +161,11 @@ public class OnlineTableBrowseService {
             }
         }
         if (!light) {
-            SchemaSnapshot snapshot = schemas.snapshot(connectionId, false, null);
+            SchemaSnapshot snapshot = schemas.snapshot(conn.getId(), false, null);
             if (!snapshot.isOk()) {
                 throw new IllegalStateException("读取线上表清单失败: " + snapshot.getError());
             }
             for (TableInfo table : snapshot.getTables()) {
-                if (!match(table.getName(), kw)) {
-                    continue;
-                }
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("name", table.getName());
                 item.put("comment", table.getComment());
@@ -479,13 +526,21 @@ public class OnlineTableBrowseService {
         return schemas.table(conn.getId(), name, force);
     }
 
-    /** 表级刷新：清这张表的线上结构缓存。 */
+    /** 表级刷新：清这张表的线上结构缓存，清单不受影响。 */
     public void evictTable(Long connectionId, String table) {
         schemas.evictTable(connectionId, table);
     }
 
-    /** 库级刷新：清该线上区域的全部单表结构缓存 + 整库快照。 */
+    /** 只清表清单缓存：线上建/删表后要重拉清单，但不必重拉已缓存的结构。 */
+    public void evictTableList(Long connectionId) {
+        if (connectionId != null) {
+            listCache.remove(connectionId);
+        }
+    }
+
+    /** 库级刷新：清该线上区域的表清单 + 全部单表结构缓存 + 整库快照。 */
     public void evictSchema(Long connectionId) {
+        evictTableList(connectionId);
         schemas.evict(connectionId);
     }
 
@@ -643,5 +698,16 @@ public class OnlineTableBrowseService {
     /** 结构快照里的索引（保留给后续「线上索引编辑」复用）。 */
     public List<IndexInfo> indexesOf(TableInfo table) {
         return table == null ? Collections.emptyList() : table.getIndexes();
+    }
+
+    /** 表清单缓存条目：expireAt < 0 表示永不过期（与单表结构缓存同一套语义）。 */
+    private static class TableListEntry {
+        final List<Map<String, Object>> data;
+        final long expireAt;
+
+        TableListEntry(List<Map<String, Object>> data, long expireAt) {
+            this.data = data;
+            this.expireAt = expireAt;
+        }
     }
 }

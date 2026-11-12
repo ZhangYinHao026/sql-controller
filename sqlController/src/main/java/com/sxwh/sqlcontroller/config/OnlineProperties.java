@@ -58,6 +58,12 @@ public class OnlineProperties {
         private boolean allowDelete = true;
         /** 写入接口路径。默认 {@code /api/sxwh/updateSql}（实测可用；{@code /api/apply/updateSql} 需登录态）。 */
         private String path = "/api/sxwh/updateSql";
+        /**
+         * 放宽 HTTPS 证书校验（信任所有证书 + 不校验主机名），默认 true。
+         * 用于「IP + HTTPS」的省份地址（如广西 https://116.252.25.89:8088，证书是 *.gxnjzx.cn，
+         * 主机名不匹配会导致 Java 握手直接失败）；置 false 恢复严格校验。
+         */
+        private boolean trustAllTls = true;
 
         public String getEncryptMode() { return encryptMode; }
         public void setEncryptMode(String encryptMode) { this.encryptMode = encryptMode; }
@@ -88,6 +94,8 @@ public class OnlineProperties {
         public void setAllowDelete(boolean allowDelete) { this.allowDelete = allowDelete; }
         public String getPath() { return path; }
         public void setPath(String path) { this.path = path; }
+        public boolean isTrustAllTls() { return trustAllTls; }
+        public void setTrustAllTls(boolean trustAllTls) { this.trustAllTls = trustAllTls; }
     }
 
     public String getBaseUrl() { return baseUrl; }

@@ -237,6 +237,23 @@ public class OnlineSchemaService {
         evictTables(connectionId);
     }
 
+    /** 从「表名 → 自增列集合」里按表名取值（表名大小写可能不一致，精确未命中再忽略大小写兜底）。 */
+    private static Map<String, Boolean> identityFor(Map<String, Map<String, Boolean>> byTable, String table) {
+        if (byTable == null || table == null) {
+            return null;
+        }
+        Map<String, Boolean> exact = byTable.get(table);
+        if (exact != null) {
+            return exact;
+        }
+        for (Map.Entry<String, Map<String, Boolean>> entry : byTable.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(table)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
     private TableInfo loadTable(Long connectionId, String name) {
         SchemaSnapshot snapshot = snapshot(connectionId, true, Collections.singletonList(name));
         TableInfo found = matchTable(snapshot, name);
@@ -437,6 +454,19 @@ public class OnlineSchemaService {
                                          boolean mysql, List<String> tableNames) {
         Map<String, List<IndexInfo>> indexByTable = null;
         Map<String, String> tableCommentByTable = null;
+        // 自增列只能整库拉（DM 走 syscolumns、神通走 sys_attribute，均无法按表过滤），
+        // 一次查全库后在内存按表名取子集；MySQL 的详情查询自带 extra=auto_increment，无需本条。
+        Map<String, Map<String, Boolean>> identityByTable = null;
+        if (!mysql) {
+            String idSql = dialect.schemaAllIdentityColumnsQuery();
+            if (idSql != null) {
+                try {
+                    identityByTable = SchemaService.groupNameSetByTableRows(fetchAll(conn, inline(idSql, schemaExpr)));
+                } catch (Exception e) {
+                    log.warn("[online-schema] 自增增强失败将降级 area={} dbType={}: {}", conn.getAreaCode(), conn.getDbType(), msg(e));
+                }
+            }
+        }
         String ixSql = dialect.schemaAllIndexesQuery();
         if (ixSql != null) {
             try {
@@ -478,8 +508,9 @@ public class OnlineSchemaService {
                     }
                 }
                 TableInfo info = new TableInfo(tableName);
+                Map<String, Boolean> identityCols = identityFor(identityByTable, tableName);
                 for (Map<?, ?> row : fetchAll(conn, inline(dialect.schemaColumnDetailQuery(), schemaExpr, tableName))) {
-                    ColumnInfo col = SchemaService.toColumnInfo(row, mysql, pkCols, comments, null);
+                    ColumnInfo col = SchemaService.toColumnInfo(row, mysql, pkCols, comments, identityCols);
                     if (col != null) info.getColumns().add(col);
                 }
                 if (!info.getColumns().isEmpty()) {

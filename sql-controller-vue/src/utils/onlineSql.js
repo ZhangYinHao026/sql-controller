@@ -9,7 +9,7 @@
 
 export const ONLINE_READ_HEADS = ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'EXPLAIN', 'WITH']
 export const ONLINE_WRITE_HEADS = ['UPDATE', 'INSERT', 'REPLACE']
-export const ONLINE_DDL_HEADS = ['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME']
+export const ONLINE_DDL_HEADS = ['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME', 'COMMENT']
 
 /** 去掉注释（用于判断某段是否只有注释）。 */
 export function stripSqlComments(text) {

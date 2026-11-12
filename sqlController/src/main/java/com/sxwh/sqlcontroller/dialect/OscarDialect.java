@@ -127,6 +127,25 @@ public class OscarDialect extends AbstractDialect {
     }
 
     /**
+     * 全库自增列批量探测（参数：schema 名 = 用户名）。
+     *
+     * <p>神通的 all_tab_columns 不暴露自增标识，自增信息在系统表 sys_attribute.attautoinc：
+     * 实测自增列（APPLY_V1.APPLY_ID）attautoinc = 406516（非 0），普通列为 0。
+     * sys_attribute 用 attrelid 关联 sys_class.oid 得到表名，再用 all_tables 限定 owner。
+     *
+     * <p>踩坑记录：这两张系统表<b>不支持 LIMIT</b>（要分页用 rownum），列名大小写敏感；
+     * all_tab_columns 里列出的 ATTISAAUTO 实际不可查询，只能用 ATTAUTOINC。
+     */
+    @Override
+    public String schemaAllIdentityColumnsQuery() {
+        return "SELECT t.table_name, a.attname AS column_name "
+                + "FROM sys_attribute a, sys_class c, all_tables t "
+                + "WHERE a.attrelid = c.oid AND t.table_name = c.relname "
+                + "AND t.owner = ? AND a.attautoinc <> 0 "
+                + "ORDER BY t.table_name, a.attnum";
+    }
+
+    /**
      * 全库索引批量探测（参数：schema 名 = 用户名）。
      *
      * <p>神通提供 Oracle 兼容视图：all_indexes（唯一性/类型）+ all_ind_columns（索引列与列序）

@@ -14,9 +14,20 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.client.RestTemplate;
 
+import java.io.IOException;
+import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.LinkedHashMap;
 import java.util.Map;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 /**
  * 线上写入：生成加密串 → 调目标省份的 {@code /api/apply/updateSql}。
@@ -41,20 +52,63 @@ public class OnlineWriteService {
 
     public OnlineWriteService(OnlineProperties properties) {
         this.properties = properties;
-        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
+        this.http = newHttpClient(properties.getWrite().getTimeoutSeconds());
+        this.ddlHttp = newHttpClient(properties.getWrite().getDdlTimeoutSeconds());
+        this.cryptoHttp = newHttpClient(properties.getWrite().getEncryptTimeoutSeconds());
+    }
+
+    /**
+     * 组装写通道的 HTTP 客户端。
+     * trust-all-tls 开启时放宽两件事（默认开）：
+     * ① 证书主机名校验——广西等省配的是 IP 地址（https://116.252.25.89:8088），
+     *    而对方返回的是正式域名证书（*.gxnjzx.cn），IP 与证书不匹配，Java 默认严格校验直接握手失败，
+     *    界面上就是「调用写入接口失败（url）：hostname in certificate didn't match」；
+     * ② 证书链校验——部分省用自签/新 CA 证书，老 JDK cacerts 里未必有根。
+     * 只放宽传输层校验，不影响写入权限后缀等业务防护。
+     */
+    private RestTemplate newHttpClient(int readTimeoutSeconds) {
+        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory() {
+            @Override
+            protected void prepareConnection(HttpURLConnection connection, String httpMethod) throws IOException {
+                if (properties.getWrite().isTrustAllTls() && connection instanceof HttpsURLConnection) {
+                    HttpsURLConnection https = (HttpsURLConnection) connection;
+                    https.setHostnameVerifier(trustAllHostnameVerifier());
+                    https.setSSLSocketFactory(trustAllSocketFactory());
+                }
+                super.prepareConnection(connection, httpMethod);
+            }
+        };
         f.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
-        f.setReadTimeout(Math.max(1, properties.getWrite().getTimeoutSeconds()) * 1000);
-        this.http = new RestTemplate(f);
+        f.setReadTimeout(Math.max(1, readTimeoutSeconds) * 1000);
+        return new RestTemplate(f);
+    }
 
-        SimpleClientHttpRequestFactory df = new SimpleClientHttpRequestFactory();
-        df.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
-        df.setReadTimeout(Math.max(1, properties.getWrite().getDdlTimeoutSeconds()) * 1000);
-        this.ddlHttp = new RestTemplate(df);
+    private HostnameVerifier trustAllHostnameVerifier() {
+        return (hostname, session) -> true;
+    }
 
-        SimpleClientHttpRequestFactory cf = new SimpleClientHttpRequestFactory();
-        cf.setConnectTimeout(Math.max(1, properties.getConnectTimeoutSeconds()) * 1000);
-        cf.setReadTimeout(Math.max(1, properties.getWrite().getEncryptTimeoutSeconds()) * 1000);
-        this.cryptoHttp = new RestTemplate(cf);
+    private volatile SSLSocketFactory trustAllFactoryCache;
+
+    private SSLSocketFactory trustAllSocketFactory() {
+        SSLSocketFactory cached = trustAllFactoryCache;
+        if (cached != null) return cached;
+        synchronized (this) {
+            if (trustAllFactoryCache == null) {
+                TrustManager[] tms = new TrustManager[]{new X509TrustManager() {
+                    @Override public void checkClientTrusted(X509Certificate[] chain, String authType) { }
+                    @Override public void checkServerTrusted(X509Certificate[] chain, String authType) { }
+                    @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                }};
+                try {
+                    SSLContext ctx = SSLContext.getInstance("TLS");
+                    ctx.init(null, tms, new SecureRandom());
+                    trustAllFactoryCache = ctx.getSocketFactory();
+                } catch (Exception e) {
+                    throw new IllegalStateException("初始化宽松 SSL 上下文失败：" + e.getMessage(), e);
+                }
+            }
+            return trustAllFactoryCache;
+        }
     }
 
     /** 执行一条写语句；调用方必须已完成二次确认。 */

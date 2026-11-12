@@ -366,10 +366,6 @@ function fmtCachedAt(ts) {
       </div>
     </header>
 
-    <div v-if="tab.env === 'online'" class="env-banner">
-      生产环境 · {{ tab.connectionName }}　改动会直接写入线上数据库，请核对 SQL 后再确认
-    </div>
-
     <div class="table-subtabs">
       <button class="tab" :class="{active: tab.view === 'data'}" @click="setView('data')">数据</button>
       <button class="tab" :class="{active: tab.view === 'struct'}" @click="setView('struct')">结构</button>

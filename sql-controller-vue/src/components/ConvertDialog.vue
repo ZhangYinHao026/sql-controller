@@ -5,12 +5,17 @@ import { highlightSql } from '../utils/sqlHighlight'
 import { formatSql } from '../utils/sqlFormat'
 import { syncCodeGutter } from '../utils/codeGutter'
 import { DB_REGISTRY, CONVERT_TARGETS, typeLabel } from '../utils/dbRegistry'
+import { onlineHead, ONLINE_READ_HEADS } from '../utils/onlineSql'
 import ConvertResultPanel from './ConvertResultPanel.vue'
 
 const props = defineProps({
     show: Boolean,
     // 全部数据库连接（App 侧传入）：用于「一键转换并执行」预检——按钮上显示将执行到哪些库、多少个
-    connections: { type: Array, default: () => [] }
+    connections: { type: Array, default: () => [] },
+    // 线上目标（App 侧传入）：启用的线上区域 / 主界面已勾选的区域 id / 服务端写通道是否启用
+    onlineRegions: { type: Array, default: () => [] },
+    onlinePreselected: { type: Array, default: () => [] },
+    onlineWriteEnabled: { type: Boolean, default: false }
 })
 const emit = defineEmits(['close', 'use-result', 'execute-all'])
 
@@ -148,7 +153,12 @@ function useResult(key) {
     emit('use-result', { text: r.text, dbType: key, warnings: r.warnings || [] })
 }
 
-/* ---------------- 一键转换并执行：把原始 SQL 交给主链路做「全类型分组执行」 ---------------- */
+/* ---------------- 一键转换并执行：目标可选 本地库 / 线上库 ---------------- */
+
+// 执行目标：local=全部本地连接按类型分组；online=弹窗内勾选的线上区域（逐区域转方言执行）
+const execTarget = ref('local')
+const onlinePicked = ref([])
+
 // 按 dbType 归类现有连接（已知类型按注册表顺序、未注册类型排后），按钮上直接显示将执行到哪些库多少个
 const execGroups = computed(() => {
     const counts = new Map()
@@ -162,18 +172,60 @@ const execGroups = computed(() => {
 })
 const execSummary = computed(() => execGroups.value.map(g => `${g.name} ${g.count}`).join(' · '))
 const hasConnections = computed(() => (props.connections || []).length > 0)
-const canExecAll = computed(() => hasConnections.value && !!inputSql.value.trim() && !loading.value)
-const execTitle = computed(() => hasConnections.value
-    ? `转成各目标方言后，对全部连接按类型执行（${execSummary.value}）`
-    : '暂无可执行的数据库连接，请先到「设置」中添加')
 
-// 弹窗内不做转换：确定「全部类型」需要 App 侧的 connections，且执行覆盖所有类型、忽略上方方言勾选。
+/* 线上区域：勾选默认带出主界面「线上·生产」已选的区域（打开弹窗时同步一次） */
+const regionMap = computed(() => new Map((props.onlineRegions || []).map(r => [r.id, r])))
+const onlineSummary = computed(() => onlinePicked.value.map(id => regionMap.value.get(id)?.regionName || `#${id}`).join('、'))
+const onlineIsRead = computed(() => ONLINE_READ_HEADS.includes(onlineHead(inputSql.value)))
+function toggleRegion(id) {
+    onlinePicked.value = onlinePicked.value.includes(id)
+        ? onlinePicked.value.filter(x => x !== id)
+        : [...onlinePicked.value, id]
+}
+function toggleAllRegions() {
+    const ids = (props.onlineRegions || []).map(r => r.id)
+    onlinePicked.value = ids.length && ids.every(id => onlinePicked.value.includes(id)) ? [] : ids
+}
+
+const canExecAll = computed(() => {
+    if (!inputSql.value.trim() || loading.value) return false
+    return execTarget.value === 'local' ? hasConnections.value : onlinePicked.value.length > 0
+})
+const execHint = computed(() => {
+    if (error.value) return ''
+    if (execTarget.value === 'online') {
+        if (!(props.onlineRegions || []).length) return '暂无启用的线上区域，请先到「线上 · 生产」中配置'
+        if (!onlinePicked.value.length) return '请勾选要执行到的线上区域'
+        const suffix = props.onlineWriteEnabled || onlineIsRead.value ? '' : '（写入通道未启用，写入类语句会被服务端拒绝）'
+        return `将执行到 ${onlinePicked.value.length} 个线上区域：${onlineSummary.value}${suffix}`
+    }
+    if (hasConnections.value) return `将执行到 ${execSummary.value}`
+    return '暂无数据库连接，请先到「设置」中添加'
+})
+const execLabel = computed(() => execTarget.value === 'online' ? '▶ 一键转换并执行到线上' : '▶ 一键转换并执行')
+const execTitle = computed(() => {
+    if (execTarget.value === 'online') {
+        if (!(props.onlineRegions || []).length) return '暂无启用的线上区域'
+        if (!onlinePicked.value.length) return '请先勾选线上区域'
+        const kind = onlineIsRead.value ? '只读语句走查询通道（多区域并行）' : '写入/DDL 多区域并行、区域内逐条串行，单条失败即停该区域'
+        return `按各区域库型转换后执行到：${onlineSummary.value}（${kind}）`
+    }
+    return hasConnections.value
+        ? `转成各目标方言后，对全部连接按类型执行（${execSummary.value}）`
+        : '暂无可执行的数据库连接，请先到「设置」中添加'
+})
+
+// 弹窗内不做转换：确定「全部类型」需要 App 侧的 connections，且本地执行覆盖所有类型、忽略上方方言勾选。
 // 只做输入校验→把原始 SQL 抛给 App.vue；由主链路负责 分组转换 → 二次确认 → 串行执行 → 关弹窗 → 结果回主界面。
 function convertAndExecute() {
     const sql = inputSql.value.trim()
-    if (!sql || !hasConnections.value) return
+    if (!sql) return
+    if (execTarget.value === 'online' && !onlinePicked.value.length) {
+        error.value = '请至少勾选一个线上区域'
+        return
+    }
     error.value = ''
-    emit('execute-all', { sql })
+    emit('execute-all', { sql, target: execTarget.value, onlineIds: [...onlinePicked.value] })
 }
 
 /* ---------------- 输入框自适应 / 滚动同步 ---------------- */
@@ -201,6 +253,9 @@ watch(() => props.show, async v => {
         await nextTick()
         if (inputArea.value) autoSize(inputArea.value)
         window.addEventListener('resize', onResize)
+        // 线上勾选默认带出主界面已选区域；主界面没有线上区域时强制回本地目标
+        onlinePicked.value = (props.onlinePreselected || []).filter(id => regionMap.value.has(id))
+        if (!(props.onlineRegions || []).length) execTarget.value = 'local'
     } else {
         window.removeEventListener('resize', onResize)
     }
@@ -233,15 +288,29 @@ onBeforeUnmount(() => window.removeEventListener('resize', onResize))
                     placeholder="在此粘贴 MySQL DDL / DML，点击「一键转换」或「一键转换并执行」…"
                     @input="autoSize(inputArea)" @scroll="syncScroll"></textarea>
         </div>
+        <!-- 一键执行目标：本地全部连接 / 线上区域（可勾选部分省份） -->
+        <div class="exec-target-row">
+          <div class="seg exec-target-seg">
+            <button type="button" :class="{ on: execTarget === 'local' }" @click="execTarget = 'local'">本地库</button>
+            <button v-if="(onlineRegions || []).length" type="button" :class="{ on: execTarget === 'online' }"
+                    @click="execTarget = 'online'">线上库</button>
+          </div>
+          <div v-if="execTarget === 'online' && (onlineRegions || []).length" class="region-chips">
+            <button v-for="r in onlineRegions" :key="r.id" type="button" class="chip region-chip"
+                    :class="{ on: onlinePicked.includes(r.id) }" @click="toggleRegion(r.id)">
+              <i></i>{{ r.regionName }}<em>{{ typeLabel(r.dbType) }}</em>
+            </button>
+            <button class="link-btn" type="button" @click="toggleAllRegions">全选 / 清空</button>
+          </div>
+        </div>
         <div class="convert-actions">
           <span v-if="error" class="convert-error">⚠ {{ error }}</span>
-          <span v-else-if="hasConnections" class="exec-hint">将执行到 {{ execSummary }}</span>
-          <span v-else class="exec-hint">暂无数据库连接，请先到「设置」中添加</span>
+          <span v-else class="exec-hint">{{ execHint }}</span>
           <button class="btn primary" :disabled="loading || !inputSql.trim()" @click="convert">
             {{ loading ? '转换中…' : '一键转换' }}
           </button>
           <button class="btn primary exec-btn" :disabled="!canExecAll" :title="execTitle" @click="convertAndExecute">
-            ▶ 一键转换并执行
+            {{ execLabel }}
           </button>
         </div>
       </div>
@@ -399,6 +468,13 @@ onBeforeUnmount(() => window.removeEventListener('resize', onResize))
 .convert-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 10px; }
 .convert-error { color: var(--danger-ink); margin-right: auto; font-size: 12.5px; }
 .exec-hint { color: var(--ink-500); margin-right: auto; font-size: 12px; }
+
+/* 执行目标行：目标切换（本地/线上）+ 线上区域勾选 */
+.exec-target-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.exec-target-seg button { font-size: 12.5px; padding: 4px 16px; }
+.region-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.region-chip { font-size: 12px; padding: 3px 10px 3px 8px; }
+.region-chip i { width: 7px; height: 7px; flex: 0 0 7px; }
 
 /* 「一键转换并执行」：与「一键转换」并列，用更深一档的主色区分（会写全部库，需一眼可辨）。
    全局 `.btn.primary` 与本类特异性同为 (0,2,0)，故用 `button.btn.exec-btn` 提高一级确保覆盖。 */

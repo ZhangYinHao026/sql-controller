@@ -1,5 +1,6 @@
 package com.sxwh.sqlcontroller.service;
 
+import com.sxwh.sqlcontroller.config.AutocompleteProperties;
 import com.sxwh.sqlcontroller.dialect.Dialect;
 import com.sxwh.sqlcontroller.dialect.DialectRegistry;
 import com.sxwh.sqlcontroller.model.ColumnInfo;
@@ -18,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 表浏览服务：表清单 / 单表结构 + DDL / 表数据分页 / CSV 导出。
@@ -45,26 +47,67 @@ public class TableBrowseService {
     private final DynamicDataSourceService executor;
     private final SchemaService schemas;
     private final DialectRegistry dialects;
+    private final AutocompleteProperties props;
+
+    /** 表清单缓存：connectionId → (全量清单, 过期时间)，TTL 与单表结构一致（默认永不过期）。 */
+    private final Map<Long, TableListEntry> listCache = new ConcurrentHashMap<>();
 
     public TableBrowseService(DatabaseConnectionService connections, DynamicDataSourceService executor,
-                              SchemaService schemas, DialectRegistry dialects) {
+                              SchemaService schemas, DialectRegistry dialects, AutocompleteProperties props) {
         this.connections = connections;
         this.executor = executor;
         this.schemas = schemas;
         this.dialects = dialects;
+        this.props = props;
     }
 
     // ==================== 表清单 ====================
 
     /**
      * 轻量表清单（只查表名 + 表注释，不扫列）。
-     * 方言字典查询失败时回退到整库结构快照（首次慢、之后走 24h 缓存）。
+     *
+     * <p>清单按连接整份缓存（TTL 与单表结构一致，默认永不过期），keyword 只过滤缓存结果，
+     * 不按关键字存多份；缓存失效入口是多级刷新 {@code /cache/refresh}。
      */
     public List<Map<String, Object>> tables(Long connectionId, String keyword) {
         DatabaseConnection conn = requireConnection(connectionId);
+        List<Map<String, Object>> all = cachedTableList(connectionId, conn);
+        String kw = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
+        if (kw.isEmpty()) {
+            return all;
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map<String, Object> item : all) {
+            if (String.valueOf(item.get("name")).toLowerCase(Locale.ROOT).contains(kw)) {
+                out.add(item);
+            }
+        }
+        return out;
+    }
+
+    /** 取整份清单：命中缓存直接返回，未命中才真查并回填。 */
+    private List<Map<String, Object>> cachedTableList(Long connectionId, DatabaseConnection conn) {
+        long ttl = props.getTableCacheSeconds();
+        if (ttl != 0) {
+            TableListEntry entry = listCache.get(connectionId);
+            if (entry != null && (entry.expireAt < 0 || System.currentTimeMillis() <= entry.expireAt)) {
+                return entry.data;
+            }
+        }
+        List<Map<String, Object>> list = Collections.unmodifiableList(loadAllTables(conn));
+        if (ttl != 0) {
+            listCache.put(connectionId, new TableListEntry(list,
+                    ttl < 0 ? -1L : System.currentTimeMillis() + ttl * 1000L));
+        }
+        return list;
+    }
+
+    /**
+     * 真查表清单。方言字典查询失败时回退到整库结构快照（首次慢、之后走 24h 缓存）。
+     */
+    private List<Map<String, Object>> loadAllTables(DatabaseConnection conn) {
         Dialect dialect = dialects.get(conn.getDbType());
         String schema = dialect.schemaName(conn);
-        String kw = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
 
         List<Map<String, Object>> out = new ArrayList<>();
         try {
@@ -75,9 +118,6 @@ public class TableBrowseService {
                 if (name == null || SchemaService.isSystemTable(name)) {
                     continue;
                 }
-                if (!kw.isEmpty() && !name.toLowerCase(Locale.ROOT).contains(kw)) {
-                    continue;
-                }
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("name", name);
                 item.put("comment", commentOf(row));
@@ -85,17 +125,14 @@ public class TableBrowseService {
             }
         } catch (Exception e) {
             log.warn("[TableBrowse] 方言表清单查询失败，回退结构快照 connectionId={} dbType={}: {}",
-                    connectionId, conn.getDbType(), e.getMessage());
+                    conn.getId(), conn.getDbType(), e.getMessage());
             out.clear();
-            SchemaSnapshot snapshot = schemas.snapshot(connectionId, false);
+            SchemaSnapshot snapshot = schemas.snapshot(conn.getId(), false);
             if (!snapshot.isOk()) {
                 throw new IllegalStateException("读取表清单失败: " + snapshot.getError());
             }
             for (TableInfo table : snapshot.getTables()) {
                 if (SchemaService.isSystemTable(table.getName())) {
-                    continue;
-                }
-                if (!kw.isEmpty() && !table.getName().toLowerCase(Locale.ROOT).contains(kw)) {
                     continue;
                 }
                 Map<String, Object> item = new LinkedHashMap<>();
@@ -317,13 +354,21 @@ public class TableBrowseService {
         return schemas.table(conn.getId(), name, force);
     }
 
-    /** 表级刷新：清这张表的结构缓存（下次打开 / 翻页重新抓）。 */
+    /** 表级刷新：清这张表的结构缓存（下次打开 / 翻页重新抓），清单不受影响。 */
     public void evictTable(Long connectionId, String table) {
         schemas.evictTable(connectionId, table);
     }
 
-    /** 库级刷新：清该连接全部单表结构缓存 + 联想缓存（加了字段，编辑器联想也该立刻能看到）。 */
+    /** 只清表清单缓存：新加/删表后要重拉清单，但不必重拉已缓存的结构。 */
+    public void evictTableList(Long connectionId) {
+        if (connectionId != null) {
+            listCache.remove(connectionId);
+        }
+    }
+
+    /** 库级刷新：清该连接的表清单 + 全部单表结构 + 联想缓存（加了字段，编辑器联想也该立刻能看到）。 */
     public void evictSchema(Long connectionId) {
+        evictTableList(connectionId);
         schemas.evict(connectionId);
     }
 
@@ -528,5 +573,16 @@ public class TableBrowseService {
 
     private Long asLong(Object value) {
         return nullableLong(value);
+    }
+
+    /** 表清单缓存条目：expireAt < 0 表示永不过期（与单表结构缓存同一套语义）。 */
+    private static class TableListEntry {
+        final List<Map<String, Object>> data;
+        final long expireAt;
+
+        TableListEntry(List<Map<String, Object>> data, long expireAt) {
+            this.data = data;
+            this.expireAt = expireAt;
+        }
     }
 }

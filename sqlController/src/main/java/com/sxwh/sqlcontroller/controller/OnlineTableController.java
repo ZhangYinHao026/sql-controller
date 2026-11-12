@@ -51,24 +51,29 @@ public class OnlineTableController {
     }
 
     /**
-     * 手动刷新线上结构缓存（与本地 /api/db/cache/refresh 同构）。
+     * 手动刷新线上缓存（与本地 /api/db/cache/refresh 同构）。
      *
-     * @param table 传表名 = 只清这张表；不传 = 重拉整个区域
+     * @param table 传表名 = 只清这张表的结构；不传 = 清整个区域（清单 + 全部结构 + 整库快照）
+     * @param scope list = 只清表清单，忽略 table
      */
     @PostMapping("/cache/refresh")
     public Map<String, Object> refreshCache(@RequestParam Long connectionId,
-                                            @RequestParam(required = false) String table) {
+                                            @RequestParam(required = false) String table,
+                                            @RequestParam(defaultValue = "all") String scope) {
+        boolean listOnly = "list".equalsIgnoreCase(scope);
         boolean wholeDatabase = table == null || table.trim().isEmpty();
-        if (wholeDatabase) {
+        if (listOnly) {
+            service.evictTableList(connectionId);
+        } else if (wholeDatabase) {
             service.evictSchema(connectionId);
         } else {
             service.evictTable(connectionId, table);
         }
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         out.put("ok", true);
-        out.put("scope", wholeDatabase ? "database" : "table");
+        out.put("scope", listOnly ? "list" : (wholeDatabase ? "database" : "table"));
         out.put("connectionId", connectionId);
-        out.put("table", wholeDatabase ? null : table);
+        out.put("table", listOnly || wholeDatabase ? null : table);
         return out;
     }
 

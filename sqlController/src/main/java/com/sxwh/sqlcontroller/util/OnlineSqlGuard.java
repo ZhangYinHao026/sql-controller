@@ -26,9 +26,10 @@ public final class OnlineSqlGuard {
             new LinkedHashSet<>(Arrays.asList("UPDATE", "INSERT", "REPLACE")));
     /** 仅当 sql-controller.online.write.allow-delete=true 时放行。 */
     public static final Set<String> DELETE_HEADS = Collections.singleton("DELETE");
-    /** 仅当 sql-controller.online.write.allow-ddl=true 时放行（后续「结构同步到线上」使用）。 */
+    /** 仅当 sql-controller.online.write.allow-ddl=true 时放行（后续「结构同步到线上」使用）。
+     *  COMMENT（COMMENT ON TABLE/COLUMN … IS '…'）在达梦/Oracle 属于 DDL，与 CREATE/ALTER 同级放行。 */
     public static final Set<String> DDL_HEADS = Collections.unmodifiableSet(
-            new LinkedHashSet<>(Arrays.asList("CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME")));
+            new LinkedHashSet<>(Arrays.asList("CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT")));
 
     private OnlineSqlGuard() {
     }

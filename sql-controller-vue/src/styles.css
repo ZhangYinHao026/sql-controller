@@ -1546,7 +1546,8 @@ button { cursor: pointer; }
 }
 
 /* —— 结构面板 —— */
-.db-struct { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* min-width:0 必须：flex 子项默认 min-width:auto，表格的固有宽度会反向把整列撑到上万像素 */
+.db-struct { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
 .db-struct-bar {
     display: flex;
     align-items: center;
@@ -1559,7 +1560,7 @@ button { cursor: pointer; }
 .db-ddl-source { padding: 1px 8px; border-radius: var(--r-pill); background: var(--cream-100); color: var(--online-ink); font-size: 10.5px; }
 .db-ddl-source.native { background: var(--mint-50); color: var(--mint-700); border: 1px solid var(--mint-100); }
 .db-struct-space { flex: 1; }
-.db-struct-scroll { flex: 1; min-height: 0; overflow: auto; }
+.db-struct-scroll { flex: 1; min-height: 0; min-width: 0; overflow: auto; }
 .db-struct-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
 .db-struct-table th {
     position: sticky;
@@ -1582,7 +1583,8 @@ button { cursor: pointer; }
 .db-struct-table .muted { color: var(--ink-500); }
 .db-index-block, .db-ddl-block { padding: 10px 12px; border-top: 1px dashed var(--ink-100); }
 .db-index-block h4, .db-ddl-head h4 { margin: 0 0 6px; font-size: 11.5px; color: var(--ink-500); }
-.db-index-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 11.5px; }
+/* 编辑态每个索引行会平铺「全部字段」的列标签，字段多时不换行会排成一条 1.6 万像素的长条 */
+.db-index-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 11.5px; flex-wrap: wrap; }
 .db-index-name { font-family: var(--font-mono); }
 .db-index-badge { padding: 0 6px; border-radius: 3px; background: var(--ink-50); color: var(--ink-500); font-size: 9.5px; }
 .db-index-badge.unique { background: var(--cream-100); color: var(--online-ink); }
@@ -1759,25 +1761,29 @@ button { cursor: pointer; }
     font-size: 11.5px;
     cursor: pointer;
 }
-.env-banner {
-    padding: 5px 12px;
-    border: 1px solid var(--online-border);
-    border-top: 0;
-    background: var(--chip-amber-bg);
-    color: var(--online-ink);
-    font-size: 11.5px;
-}
-
 /* —— 线上连接行 —— */
 .db-conn-head.online .db-conn-name { color: var(--online-ink); }
 
 /* —— 结构编辑 —— */
+/*
+ * 编辑态必须锁死列宽：单元格里放的是 width:100% 的 input，auto 布局会按 input 的固有宽度
+ * 反复放大列宽，一张 147 字段的表能把表格撑到 16000px+，整页跟着横向溢出。
+ */
+.db-struct-table.is-editing { table-layout: fixed; }
+.db-struct-table.is-editing th:nth-child(1) { width: 17%; }
+.db-struct-table.is-editing th:nth-child(2) { width: 22%; }
+.db-struct-table.is-editing th:nth-child(3) { width: 7%; }
+.db-struct-table.is-editing th:nth-child(4) { width: 7%; }
+.db-struct-table.is-editing th:nth-child(5) { width: 7%; }
+.db-struct-table.is-editing th:nth-child(6) { width: 16%; }
+.db-struct-table.is-editing th:nth-child(7) { width: 19%; }
+.db-struct-table.is-editing th:nth-child(8) { width: 5%; }
 .db-struct-table.is-editing td { padding: 3px 6px; vertical-align: middle; }
 .db-struct-table tr.struct-new td { background: var(--mint-50); }
 .db-struct-table tr.struct-add-row td { padding: 6px 10px; border-bottom: 0; }
 .struct-input {
     width: 100%;
-    min-width: 70px;
+    min-width: 0;
     height: 24px;
     padding: 0 6px;
     border: 1px solid var(--ink-100);

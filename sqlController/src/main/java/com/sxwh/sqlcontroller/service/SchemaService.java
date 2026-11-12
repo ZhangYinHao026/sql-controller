@@ -746,11 +746,21 @@ public class SchemaService {
         } else {
             col.setNullable(nullableOrNull(firstNonNull(str(row, "is_nullable"), str(row, "nullable"))));
             col.setPrimaryKey(pkCols == null ? null : pkCols.containsKey(norm(column)));
-            col.setAutoIncrement(identityCols == null ? null : identityCols.containsKey(norm(column)));
+            // 自增两条线索：①系统表 identity 标志；②默认值是 nextval(序列)
+            // ——神通/PG 的 SERIAL 只是建表语法糖，落库就是「普通整型 + DEFAULT nextval(...)」，
+            //   不按②识别的话，用 SERIAL 建的表在结构页永远是「不自增 + 一串 nextval」。
+            col.setAutoIncrement(isNextvalDefault(str(row, "data_default"))
+                    ? Boolean.TRUE
+                    : (identityCols == null ? null : identityCols.containsKey(norm(column))));
             col.setComment(comments == null ? null : comments.get(norm(column)));
             col.setDefaultValue(str(row, "data_default"));
         }
         return col;
+    }
+
+    /** 默认值是否形如 {@code nextval('schema.seq'::text)}（序列取值，语义等同自增）。 */
+    static boolean isNextvalDefault(String defaultValue) {
+        return defaultValue != null && defaultValue.trim().toLowerCase(java.util.Locale.ROOT).matches("^nextval\\s*\\(.*");
     }
 
     /** 需要「长度」参数的类型（DM/神通字典 char_length 给出声明长度）。 */

@@ -17,7 +17,7 @@
  */
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from 'vue'
 import {api} from '../api'
-import {eqName, genCreateTable, genIndexStmts, indexCols, indexDiff, commentDiff, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, toEngineIndexes, typeForTarget, appendOrReplaceBlock} from '../utils/schemaDiff'
+import {eqName, genCreateTable, genIndexStmts, idForTarget, indexCols, indexDiff, commentDiff, metaParts, mergedColsIx, sqlStr, statTable, statTableIx, stmtsFor, toEngineCol, toEngineIndexes, typeForTarget, appendOrReplaceBlock} from '../utils/schemaDiff'
 import {assembleStatements} from '../utils/sqlStatements'
 import {typeLabel} from '../utils/dbRegistry'
 import {pruneDiffSession} from '../state/diffSession'
@@ -593,13 +593,15 @@ function genLibAddsInner(cmpId) {
 function addColDef(f, notes, opts) {
   // 与 schemaDiff.genAdd 同语义；此处需独立产出（表级循环没有逐列 stmtsFor choose 上下文）
   // 类型按**目标库类型**整备：目标 MySQL 且基准是达梦/神通时转等价 MySQL 名（否则直发会报 1064）。
+  // 列名同步按目标库整理：MySQL 目标把达梦/神通字典的大写名转小写（避免建出大写列）。
   const type = typeForTarget(f, opts && opts.table, opts && opts.targetType, notes)
-  let s = '`' + f.name + '` ' + type
+  const name = idForTarget(f.name, opts && opts.targetType)
+  let s = '`' + name + '` ' + type
   const isText = /TEXT|BLOB|CLOB|JSON|XML/i.test(type)
   const noDefault = f.default === undefined || f.default === null
   if (f.notNull) {
-    if (noDefault && !isText) { s += ' NULL'; notes.push('列 `' + f.name + '` NOT NULL 无默认值，跨方言 ADD 未自动兜底，请人工补 DEFAULT 后执行') }
-    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + f.name + '` 为 ' + type + ' 且 NOT NULL，已退化为可空 NULL（请人工确认）') }
+    if (noDefault && !isText) { s += ' NULL'; notes.push('列 `' + name + '` NOT NULL 无默认值，跨方言 ADD 未自动兜底，请人工补 DEFAULT 后执行') }
+    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + name + '` 为 ' + type + ' 且 NOT NULL，已退化为可空 NULL（请人工确认）') }
     else { s += ' NOT NULL'; if (!noDefault) s += ' DEFAULT ' + (typeof f.default === 'number' ? f.default : sqlStr(f.default)) }
   } else if (!noDefault) s += ' DEFAULT ' + (typeof f.default === 'number' ? f.default : sqlStr(f.default))
   if (f.comment) s += ' COMMENT ' + sqlStr(f.comment)

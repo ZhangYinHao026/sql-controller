@@ -80,27 +80,49 @@ public final class DbDdlBuilder {
         return ddl.toString();
     }
 
-    /** 单列定义：名称 类型 [NOT NULL] [DEFAULT x] [AUTO_INCREMENT / 内联注释]。 */
+    /** 单列定义：名称 类型 [自增子句] [NOT NULL] [DEFAULT x] [AUTO_INCREMENT / 内联注释]。 */
     private static String columnLine(ColumnInfo column, Dialect dialect, boolean mysql) {
+        boolean identity = Boolean.TRUE.equals(column.getAutoIncrement());
+        // 神通/PG 用伪类型表达自增：SERIAL/BIGSERIAL 自带「建序列 + DEFAULT nextval」，
+        // 不能再追加原来的 DEFAULT NEXTVAL(...)（会变成重复默认值，语法直接报错）
+        boolean serialized = identity && !mysql && dialect.pseudoTypeIdentity();
+        String type = column.getType() == null || column.getType().trim().isEmpty() ? "VARCHAR(255)" : column.getType().trim();
         StringBuilder line = new StringBuilder();
         line.append(dialect.quoteAlways(column.getName())).append(" ");
-        line.append(column.getType() == null || column.getType().trim().isEmpty() ? "VARCHAR(255)" : column.getType().trim());
+        if (serialized) {
+            line.append(serialType(type));
+        } else {
+            line.append(type);
+            if (identity && !mysql) {
+                line.append(" ").append(dialect.identityClause());
+            }
+        }
         if (Boolean.FALSE.equals(column.getNullable())) {
             line.append(" NOT NULL");
         }
-        if (notEmpty(column.getDefaultValue())) {
+        if (!serialized && notEmpty(column.getDefaultValue())) {
             line.append(" DEFAULT ").append(column.getDefaultValue().trim());
         }
-        if (Boolean.TRUE.equals(column.getAutoIncrement())) {
-            // MySQL 是列属性；达梦/神通的自增已经体现在快照返回的类型里（IDENTITY / SERIAL），不再追加
-            if (mysql) {
-                line.append(" AUTO_INCREMENT");
-            }
+        if (identity && mysql) {
+            // MySQL 是列属性（非 mysql 的已在类型处处理：DM=IDENTITY(1,1)、神通=SERIAL）
+            line.append(" AUTO_INCREMENT");
         }
         if (mysql && notEmpty(column.getComment())) {
             line.append(" COMMENT '").append(escape(column.getComment())).append("'");
         }
         return line.toString();
+    }
+
+    /** 神通/PostgreSQL 伪类型自增：INT2→SMALLSERIAL、INT8/BIGINT→BIGSERIAL，其余整型→SERIAL。 */
+    private static String serialType(String type) {
+        String t = type.toUpperCase(Locale.ROOT).trim();
+        if (t.startsWith("INT8") || t.startsWith("BIGINT")) {
+            return "BIGSERIAL";
+        }
+        if (t.startsWith("INT2") || t.startsWith("SMALLINT")) {
+            return "SMALLSERIAL";
+        }
+        return "SERIAL";
     }
 
     /** 主键列（快照里 primaryKey=true 的列，按原始顺序）。 */

@@ -206,10 +206,12 @@ export const api = {
     }),
     // CSV 导出走 blob：request() 会按文本解析，二进制/文件名都得单独处理
     dbTableExport: (body) => download('/api/db/table-export', body),
-    // 手动刷新结构缓存（缓存默认永不过期）：传 table 只清这张表，不传清整个库（连带联想缓存）
-    dbCacheRefresh: (connectionId, table) => request(`/api/db/cache/refresh?${new URLSearchParams({
+    // 手动刷新缓存（表清单与结构默认都不过期）：传 table 只清这张表，不传清整个库（连带联想缓存）
+    // scope='list' 只清表清单（树上 ⟳ 用，不重拉结构）
+    dbCacheRefresh: (connectionId, table, scope) => request(`/api/db/cache/refresh?${new URLSearchParams({
         connectionId,
-        ...(table ? {table} : {})
+        ...(table ? {table} : {}),
+        ...(scope ? {scope} : {})
     })}`, {method: 'POST'}),
     /* ---------------- 线上（生产）表浏览：与本地同构，仅前缀不同 ---------------- */
     onlineDbTables: (connectionId, keyword) => request(`/api/online/db/tables?${new URLSearchParams({
@@ -220,10 +222,11 @@ export const api = {
         connectionId, name,
         ...(refresh ? {refresh: 'true'} : {})
     })}`, {timeoutMs: 180000}),
-    // 线上结构缓存刷新（与本地同构）：线上一次未命中就是 3 次小助手往返，缓存收益更大
-    onlineDbCacheRefresh: (connectionId, table) => request(`/api/online/db/cache/refresh?${new URLSearchParams({
+    // 线上缓存刷新（与本地同构）：线上一次未命中就是 3 次小助手往返，缓存收益更大
+    onlineDbCacheRefresh: (connectionId, table, scope) => request(`/api/online/db/cache/refresh?${new URLSearchParams({
         connectionId,
-        ...(table ? {table} : {})
+        ...(table ? {table} : {}),
+        ...(scope ? {scope} : {})
     })}`, {method: 'POST'}),
     onlineDbTableData: (body) => request('/api/online/db/table-data', {
         method: 'POST', body: JSON.stringify(body), timeoutMs: 180000

@@ -3,9 +3,9 @@
  * 左侧「表」面板：本地 / 线上 两个根 → 连接 → 表。
  *
  * 只负责「选表」这件事：双击表把 Tab 打开（state/tableTabs），数据由 TableWorkspace 自己加载。
- * 表清单按连接懒加载并缓存，点 ⟳ 才重拉（大库首拉可能几秒）。
+ * 表清单按连接懒加载；后端也按连接整份缓存（默认不过期），⟳ / 右键「刷新该库」才失效。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import { openTable, tableTabs, invalidateTab } from '../../state/tableTabs'
 import { pushSql } from '../../state/sqlBridge'
@@ -51,7 +51,18 @@ async function loadLocal(force = false) {
       const old = previous.get(item.id)
       return old ? Object.assign(old, item) : decorate(item)
     })
-    if (force) localRoot.value.connections.forEach(item => (item.tablesAt = 0))
+    if (force) {
+      // 表清单在后端也按连接永久缓存（与结构一致），⟳ 必须把清单缓存一起清掉，否则重展还是旧清单
+      const opened = localRoot.value.connections.filter(item => item.open)
+      await Promise.all(localRoot.value.connections.map(item =>
+        api.dbCacheRefresh(item.id, null, 'list').catch(() => {})))
+      localRoot.value.connections.forEach(item => (item.tablesAt = 0))
+      if (keyword.value.trim()) {
+        await ensureAllTables()
+      } else {
+        await Promise.all(opened.map(item => loadTables(item, 'local')))
+      }
+    }
   } catch (e) {
     error.value = e.message
   } finally {
@@ -121,19 +132,45 @@ function tableText(table) {
   return `${table.name || ''} ${table.comment || ''}`.toLowerCase()
 }
 
+/** 关键字命中连接名（如「福建」「MySQL」）时展示该库全部表；否则只展示命中的表。 */
 function visibleTables(connection) {
   const kw = keyword.value.trim().toLowerCase()
   if (!kw) return connection.tables
+  if (connectionText(connection).includes(kw)) return connection.tables
   return connection.tables.filter(table => tableText(table).includes(kw))
 }
 
-/** 关键字命中连接名时展示全部表；否则只展示命中的表；都没命中则该连接整行隐藏。 */
-function connectionVisible(connection) {
-  const kw = keyword.value.trim().toLowerCase()
-  if (!kw) return true
-  if (connectionText(connection).includes(kw)) return true
-  return connection.tables.some(table => tableText(table).includes(kw))
+/**
+ * 搜索时补齐还没拉过表清单的连接。
+ * 表清单是「展开才加载」的，若不补齐，筛选结果会取决于历史上展开过哪些区域
+ * （看起来就是有时 3 个区域、有时 4 个），且区域本身还会被整行隐藏。
+ * 这里只补数据，不改变连接的展开状态；限并发避免十几个区域同时打后端。
+ */
+const SEARCH_CONCURRENCY = 3
+async function ensureAllTables() {
+  const queue = []
+  for (const root of roots) {
+    if (!root.open) continue
+    for (const connection of root.connections) {
+      if (!connection.tablesAt && !connection.loading) queue.push([connection, root.key])
+    }
+  }
+  if (!queue.length) return
+  const workers = Array.from({length: Math.min(SEARCH_CONCURRENCY, queue.length)}, async () => {
+    while (queue.length) {
+      const [connection, env] = queue.shift()
+      await loadTables(connection, env)
+    }
+  })
+  await Promise.all(workers)
 }
+
+let searchTimer = null
+watch(keyword, value => {
+  clearTimeout(searchTimer)
+  if (!value.trim()) return
+  searchTimer = setTimeout(ensureAllTables, 250)
+})
 
 function isActive(connection, table, env) {
   return tableTabs.activeKey === `${env}:${connection.id}:${table.name}`
@@ -244,11 +281,13 @@ async function refreshConnection(connection, env) {
   await loadTables(connection, env)
 }
 
-function toggleRoot(root) {
+async function toggleRoot(root) {
   root.open = !root.open
   if (root.key === 'online' && root.open && !root.connections.length) {
-    loadOnline()
+    await loadOnline()
   }
+  // 先输入关键字、后展开根节点时，同样要把新出现的连接补齐表清单
+  if (root.open && keyword.value.trim()) ensureAllTables()
 }
 
 onMounted(loadLocal)
@@ -273,7 +312,8 @@ onMounted(loadLocal)
       <div v-if="root.open" class="db-root-body">
         <div v-if="root.loading" class="command-empty">加载中…</div>
         <template v-else>
-          <div v-for="connection in root.connections" v-show="connectionVisible(connection)"
+          <!-- 筛选只作用在表上：连接（区域）恒定全部展示，不因关键字而增删 -->
+          <div v-for="connection in root.connections"
                :key="`${root.key}-${connection.id}`" class="db-conn">
             <button class="db-conn-head" :class="{ online: root.key === 'online' }"
                     :title="prettyName(connection)"
@@ -287,17 +327,21 @@ onMounted(loadLocal)
             <div v-if="connection.open" class="db-tables">
               <div v-if="connection.loading" class="command-empty">读取表清单…</div>
               <div v-else-if="connection.error" class="db-tree-error">{{ connection.error }}</div>
+              <div v-else-if="!connection.tablesAt && keyword.trim()" class="command-empty">读取表清单…</div>
               <div v-else-if="!visibleTables(connection).length" class="command-empty">
                 {{ connection.tables.length ? '无匹配表' : '该库没有可浏览的表' }}
               </div>
-              <button v-for="table in visibleTables(connection)" :key="table.name" class="db-table"
-                      :class="{ active: isActive(connection, table, root.key) }"
-                      :title="table.comment || table.name"
-                      @dblclick="openTableData(connection, table, root.key)"
-                      @contextmenu.prevent="showContext(connection, table, $event, root.key)">
-                <span class="db-table-name">{{ table.name }}</span>
-                <span v-if="table.comment" class="db-table-comment">{{ table.comment }}</span>
-              </button>
+              <!-- 加载中/出错时不渲染旧表清单，否则「读取表清单…」和上一次的结果会同时挂在树上 -->
+              <template v-else>
+                <button v-for="table in visibleTables(connection)" :key="table.name" class="db-table"
+                        :class="{ active: isActive(connection, table, root.key) }"
+                        :title="table.comment || table.name"
+                        @dblclick="openTableData(connection, table, root.key)"
+                        @contextmenu.prevent="showContext(connection, table, $event, root.key)">
+                  <span class="db-table-name">{{ table.name }}</span>
+                  <span v-if="table.comment" class="db-table-comment">{{ table.comment }}</span>
+                </button>
+              </template>
             </div>
           </div>
 

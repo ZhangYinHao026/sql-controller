@@ -73,24 +73,29 @@ public class TableBrowseController {
     }
 
     /**
-     * 手动刷新结构缓存（表浏览的结构缓存默认永不过期，这是唯一的失效入口）。
+     * 手动刷新缓存（表清单与结构的缓存默认都不过期，这是唯一的失效入口）。
      *
-     * @param table 传表名 = 只清这张表；不传 = 重拉整个库（同时清联想缓存）
+     * @param table 传表名 = 只清这张表的结构；不传 = 清整个库（清单 + 全部结构 + 联想缓存）
+     * @param scope list = 只清表清单（树上 ⟳），忽略 table
      */
     @PostMapping("/cache/refresh")
     public Map<String, Object> refreshCache(@RequestParam Long connectionId,
-                                            @RequestParam(required = false) String table) {
+                                            @RequestParam(required = false) String table,
+                                            @RequestParam(defaultValue = "all") String scope) {
+        boolean listOnly = "list".equalsIgnoreCase(scope);
         boolean wholeDatabase = table == null || table.trim().isEmpty();
-        if (wholeDatabase) {
+        if (listOnly) {
+            service.evictTableList(connectionId);
+        } else if (wholeDatabase) {
             service.evictSchema(connectionId);
         } else {
             service.evictTable(connectionId, table);
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
-        out.put("scope", wholeDatabase ? "database" : "table");
+        out.put("scope", listOnly ? "list" : (wholeDatabase ? "database" : "table"));
         out.put("connectionId", connectionId);
-        out.put("table", wholeDatabase ? null : table);
+        out.put("table", listOnly || wholeDatabase ? null : table);
         return out;
     }
 }

@@ -163,6 +163,24 @@ export function guessDefault(type) {
 }
 
 /**
+ * 标识符按目标库整理大小写：MySQL 目标把「纯大写」标识符转成小写。
+ *
+ * 达梦/神通字典把未加引号的标识符统一规范成大写，直接把这些大写列名/索引名写进
+ * MySQL 的 ADD COLUMN / CREATE TABLE / CREATE INDEX，会在 MySQL 里建出大写名字
+ * （MySQL 按书写原样保存）；DM/神通本身大小写不敏感，转不转都指向同一对象。
+ * 只转「全大写」的（字典规范化产物），本来就混合大小写的名字原样保留。
+ *
+ * @param name       标识符（列名/索引名）
+ * @param targetType 目标库 dbType：mysql | dm | oscar（空按 mysql 处理）
+ */
+export function idForTarget(name, targetType) {
+  const s = String(name || '')
+  const target = String(targetType || 'mysql').toLowerCase()
+  if (target !== 'mysql') return s
+  return /^[A-Z][A-Z0-9_$#]*$/.test(s) ? s.toLowerCase() : s
+}
+
+/**
  * 生成 MySQL 风格 ADD COLUMN 列定义（不含 'ADD COLUMN' 前缀）。
  *
  * @param opts 可选 {targetType, table}：目标库 dbType —— 目标为 MySQL 时把基准库的
@@ -170,12 +188,13 @@ export function guessDefault(type) {
  */
 export function genAdd(f, notes, opts) {
   const type = typeForTarget(f, opts && opts.table, opts && opts.targetType, notes)
-  let s = '`' + f.name + '` ' + type
+  const name = idForTarget(f.name, opts && opts.targetType)
+  let s = '`' + name + '` ' + type
   const isText = /TEXT|BLOB|CLOB|JSON|XML/i.test(type)
   const noDefault = f.default === undefined || f.default === null
   if (f.notNull) {
-    if (noDefault && !isText) { const d = guessDefault(type); s += ' NOT NULL DEFAULT ' + d; notes.push('列 `' + f.name + '` NOT NULL 且无默认值，已按类型兜底 DEFAULT ' + d + '（请核对取值）') }
-    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + f.name + '` 为 ' + type + ' 且 NOT NULL，文本列无法加默认值，已退化为可空 NULL（请人工确认）') }
+    if (noDefault && !isText) { const d = guessDefault(type); s += ' NOT NULL DEFAULT ' + d; notes.push('列 `' + name + '` NOT NULL 且无默认值，已按类型兜底 DEFAULT ' + d + '（请核对取值）') }
+    else if (noDefault && isText) { s += ' NULL'; notes.push('列 `' + name + '` 为 ' + type + ' 且 NOT NULL，文本列无法加默认值，已退化为可空 NULL（请人工确认）') }
     else { s += ' NOT NULL'; if (!noDefault) s += ' DEFAULT ' + lit(f.default) }
   } else if (!noDefault) s += ' DEFAULT ' + lit(f.default)
   if (f.comment) s += ' COMMENT ' + sqlStr(f.comment)
@@ -187,7 +206,7 @@ export function genAdd(f, notes, opts) {
  * @param opts 可选 {targetType, table}：类型整备规则同 {@link genAdd}。
  */
 export function genMod(l, r, notes, opts) {
-  let s = '`' + l.name + '` ' + typeForTarget(l, opts && opts.table, opts && opts.targetType, notes)
+  let s = '`' + idForTarget(l.name, opts && opts.targetType) + '` ' + typeForTarget(l, opts && opts.table, opts && opts.targetType, notes)
   s += l.notNull ? ' NOT NULL' : ' NULL'
   if (l.default !== undefined && l.default !== null) s += ' DEFAULT ' + lit(l.default)
   const cmt = (l.comment !== undefined && l.comment !== '') ? l.comment : r.comment
@@ -278,14 +297,16 @@ export function genCreateTable(table, cols, notes, extra) {
     colUpper.add(String(f.name).toUpperCase())
     const tt = toMysqlType(f, table)
     tt.hints.forEach(h => hints.push(h))
-    let s = '  `' + f.name + '` ' + tt.type
+    // 列名转小写：基准库是达梦/神通时字典给大写名，MySQL 按书写原样建列会得到大写列名
+    const colName = idForTarget(f.name, 'mysql')
+    let s = '  `' + colName + '` ' + tt.type
     if (f.pk || f.autoIncrement) s += ' NOT NULL'           // 主键/自增列必须非空
     else if (f.notNull) s += ' NOT NULL'
     else s += ' NULL'
     if (f.default !== undefined && f.default !== null) s += ' DEFAULT ' + lit(f.default)
     if (f.autoIncrement) s += ' AUTO_INCREMENT'
     if (f.comment) s += ' COMMENT ' + sqlStr(f.comment)
-    if (f.pk) pks.push('`' + f.name + '`')
+    if (f.pk) pks.push('`' + colName + '`')
     defs.push(s)
   })
   if (pks.length) defs.push('  PRIMARY KEY (' + pks.join(', ') + ')')
@@ -300,8 +321,8 @@ export function genCreateTable(table, cols, notes, extra) {
         + '（表达式索引/函数索引无法还原），已跳过，请在目标库手工创建')
       return
     }
-    defs.push('  ' + (ix.unique ? 'UNIQUE KEY ' : 'KEY ') + '`' + ix.name + '` ('
-      + cols2.map(c => '`' + c + '`').join(', ') + ')')
+    defs.push('  ' + (ix.unique ? 'UNIQUE KEY ' : 'KEY ') + '`' + idForTarget(ix.name, 'mysql') + '` ('
+      + cols2.map(c => '`' + idForTarget(c, 'mysql') + '`').join(', ') + ')')
   })
   const tc = extra && extra.comment ? String(extra.comment).trim() : ''
   const head = 'CREATE TABLE `' + table + '` (\n'
@@ -369,8 +390,8 @@ export function indexDiff(L, R) {
 export function genIndexStmts(indexes, table) {
   return (indexes || [])
     .filter(ix => ix && ix.name && (ix.columns || []).length)
-    .map(ix => 'CREATE ' + (ix.unique ? 'UNIQUE ' : '') + 'INDEX `' + ix.name + '` ON `' + table + '` ('
-      + ix.columns.map(c => '`' + c + '`').join(', ') + ');')
+    .map(ix => 'CREATE ' + (ix.unique ? 'UNIQUE ' : '') + 'INDEX `' + idForTarget(ix.name, 'mysql') + '` ON `' + table + '` ('
+      + ix.columns.map(c => '`' + idForTarget(c, 'mysql') + '`').join(', ') + ');')
 }
 
 /** 表注释差异：空/空视为一致，仅一侧有值按缺失方向标记（忽略首尾空白）。 */
@@ -442,7 +463,7 @@ export function stmtsFor(baseCols, cmpCols, table, choose, opts) {
     const l = L.find(f => eqName(f.name, n)), r = R.find(f => eqName(f.name, n))
     const cs = colStatus(l, r)
     if (cs.kind === 'add' && choose(n, 'add')) adds.push('ADD COLUMN ' + genAdd(l, notes, cOpts))
-    else if (cs.kind === 'drop' && choose(n, 'drop')) { drops.push('DROP COLUMN `' + n + '`'); dropNames.push(n) }
+    else if (cs.kind === 'drop' && choose(n, 'drop')) { drops.push('DROP COLUMN `' + idForTarget(n, cOpts.targetType) + '`'); dropNames.push(n) }
     else if (cs.kind === 'alt' && choose(n, 'mod')) { mods.push('MODIFY COLUMN ' + genMod(l, r, notes, cOpts)); modNames.push(n) }
     else if (cs.kind === 'pk') pks.push(n)
   })
