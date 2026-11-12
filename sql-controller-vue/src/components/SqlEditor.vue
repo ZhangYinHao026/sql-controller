@@ -10,7 +10,9 @@ import { tags } from '@lezer/highlight'
 import { formatSql } from '../utils/sqlFormat'
 import { paramDecoration } from '../utils/paramDecoration'
 import { loadAutocompleteSchema, toCM6Schema } from '../utils/autocompleteSchema'
-import { keywordFilteredCompletionSource, businessCompletionSource } from '../utils/sqlWords'
+import { keywordFilteredCompletionSource, businessCompletionSource, sqlFunctionCompletionSource } from '../utils/sqlWords'
+import { makeColumnCompletionSource } from '../utils/sqlColumnCompletion'
+import { toTableIndex } from '../utils/sqlColumnContext'
 
 const props = defineProps({
   modelValue: { type: String, required: true },
@@ -22,6 +24,8 @@ const container = ref(null)
 const cmFailed = ref(false)
 let view = null
 let updating = false
+/* 列名联想用的表索引（小写表名 → 列），schema 拉回来后才填 */
+let completionTables = null
 /* 语言扩展放 Compartment：初始用纯 MySQL 方言，schema 注入后用带 schema 的版本替换（避免重复注册 SQL 语言） */
 const schemaCompartment = new Compartment()
 
@@ -173,7 +177,12 @@ onMounted(async () => {
            用白名单过滤后的源替代（表/列/函数照常，见 utils/sqlWords.js），再叠加业务补充词 */
         autocompletion({
           activateOnTyping: true,
-          override: [keywordFilteredCompletionSource, businessCompletionSource]
+          override: [
+            keywordFilteredCompletionSource,
+            businessCompletionSource,
+            sqlFunctionCompletionSource,
+            makeColumnCompletionSource(() => completionTables)
+          ]
         }),
         keymap.of([...defaultKeymap, ...completionKeymap, ...historyKeymap, {
           /* Tab：联想菜单打开且选中项时接受（与回车一致）；否则回落到缩进；Shift+Tab 反缩进 */
@@ -198,10 +207,12 @@ onMounted(async () => {
   }
 
   /* 懒加载联想 schema 并注入（enabled=false / 失败 → 纯关键字联想；注入失败不影响编辑）
-     每次挂载都 force=true 拉最新 — 避免浏览器 localStorage 中旧 schema（被误认为还在 TTL 内）让联想长期落后于后端；
-     同一会话内因 memoryCache 不会重复拉。 */
+     前端不再缓存：直接问后端，命中后端缓存很快；执行 DDL 后由后端自行失效。 */
   try {
-    const schema = await loadAutocompleteSchema(true)
+    const schema = await loadAutocompleteSchema()
+    if (schema?.enabled && Array.isArray(schema.tables)) {
+      completionTables = toTableIndex(schema)
+    }
     if (view && schema?.enabled && Array.isArray(schema.tables)) {
       view.dispatch({ effects: schemaCompartment.reconfigure(sql({ dialect: MySQL, schema: toCM6Schema(schema) })) })
     }

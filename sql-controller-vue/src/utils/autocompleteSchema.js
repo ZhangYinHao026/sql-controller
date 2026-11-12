@@ -1,50 +1,18 @@
-/* 联想数据源：GET /api/autocomplete/schema 拉取 + 前端缓存
+/* 联想数据源：GET /api/autocomplete/schema 拉取
    - 懒加载（首次进入编辑器才调）
-   - localStorage + 内存双重缓存，TTL 与后端（schema-cache-seconds，默认 3600s）一致
+   - 前端不留副本：后端按连接缓存（默认 24h），执行 DDL 后后端自己失效
+   - force=true 才要求后端重查（手动重载用）
    - enabled=false / 请求失败 → 返回 { enabled:false }，编辑器降级为纯关键字联想 */
 
 import { api } from '../api'
 
-const CACHE_KEY = 'sql-autocomplete-schema'
-const TTL_MS = 3600 * 1000
-
-let memoryCache = null
-
 export async function loadAutocompleteSchema(force = false) {
-  /* 内存缓存 */
-  if (!force && memoryCache) return memoryCache
-
-  /* localStorage 缓存 */
-  if (!force) {
-    try {
-      const raw = localStorage.getItem(CACHE_KEY)
-      if (raw) {
-        const { data, ts } = JSON.parse(raw)
-        if (Date.now() - ts < TTL_MS) {
-          memoryCache = data
-          return data
-        }
-      }
-    } catch { /* 忽略损坏缓存 */ }
-  }
-
   try {
-    const data = await api.autocompleteSchema()
-    memoryCache = data
-    try {
-      localStorage.setItem(CACHE_KEY, JSON.stringify({ data, ts: Date.now() }))
-    } catch { /* localStorage 不可用时忽略 */ }
-    return data
+    return await api.autocompleteSchema(force)
   } catch (e) {
     console.warn('[autocomplete] 联想数据源加载失败，降级为纯关键字联想:', e.message)
     return { enabled: false }
   }
-}
-
-/* 手动刷新（如"测试连接"成功后主动失效缓存） */
-export function clearAutocompleteCache() {
-  memoryCache = null
-  try { localStorage.removeItem(CACHE_KEY) } catch { /* ignore */ }
 }
 
 /* 后端 schema 结构 → CodeMirror lang-sql 的 SchemaConfig 结构

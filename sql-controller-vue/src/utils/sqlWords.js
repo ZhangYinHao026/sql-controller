@@ -8,6 +8,8 @@
 
    另：BUSINESS_WORDS 为公司业务补充词，两块合起来构成编辑器的全部联想来源 */
 
+import { isColumnContext } from './sqlColumnContext.js'
+
 /* ===== 1. 关键字白名单 ===== */
 export const SQL_KEYWORD_WHITELIST = [
   /* 查询 */
@@ -64,7 +66,53 @@ export function businessCompletionSource(context) {
   return options.length ? { from: word.from, options } : null
 }
 
-/* ===== 3. 白名单过滤补全源 =====
+/* ===== 3. 函数补全（lang-sql 词表里没有函数） ===== */
+const FUNCTION_DEFS = [
+  ['count', '计数'], ['sum', '求和'], ['avg', '平均'], ['min', '最小'], ['max', '最大'],
+  ['ifnull', '空值替换'], ['coalesce', '取第一个非空'], ['nullif', '相等则返回 NULL'],
+  ['concat', '拼接'], ['concat_ws', '带分隔符拼接'], ['substring', '截取'], ['substr', '截取'],
+  ['length', '字节长度'], ['char_length', '字符长度'], ['trim', '去空格'], ['ltrim', '去左空格'], ['rtrim', '去右空格'],
+  ['instr', '子串位置'], ['locate', '子串位置'], ['upper', '转大写'], ['lower', '转小写'],
+  ['lpad', '左填充'], ['rpad', '右填充'], ['reverse', '反转'], ['replace', '替换'],
+  ['now', '当前时间'], ['curdate', '当前日期'], ['curtime', '当前时间'], ['date_format', '格式化日期'],
+  ['str_to_date', '字符串转日期'], ['datediff', '日期差'], ['timestampdiff', '时间差'],
+  ['date_add', '日期加'], ['date_sub', '日期减'], ['last_day', '月末日期'],
+  ['unix_timestamp', '时间戳'], ['from_unixtime', '时间戳转时间'],
+  ['round', '四舍五入'], ['ceil', '向上取整'], ['floor', '向下取整'], ['abs', '绝对值'],
+  ['mod', '取余'], ['pow', '幂'], ['rand', '随机数'],
+  ['cast', '类型转换'], ['json_extract', '取 JSON 字段'], ['json_unquote', 'JSON 去引号'],
+  ['json_length', 'JSON 长度'], ['json_object', '构造 JSON 对象'], ['json_array', '构造 JSON 数组'],
+  ['group_concat', '分组拼接'], ['row_number', '行号'], ['rank', '排名'], ['dense_rank', '连续排名'],
+  ['lag', '上一行'], ['lead', '下一行'], ['first_value', '窗口首值'], ['last_value', '窗口末值'],
+  ['greatest', '取最大'], ['least', '取最小'], ['md5', 'MD5'], ['uuid', 'UUID']
+]
+
+/* 与关键字重名的函数不再补（否则下拉里出现两条一模一样的词） */
+const FUNCTION_OPTIONS = FUNCTION_DEFS
+  .filter(([name]) => !KEYWORD_SET.has(name))
+  .map(([name, detail]) => ({
+    label: name,
+    detail,
+    type: 'function',
+    /* 插入 name() 并把光标放在括号里 */
+    apply: (view, _completion, from, to) => {
+      const insert = name + '()'
+      view.dispatch({ changes: { from, to, insert }, selection: { anchor: from + insert.length - 1 } })
+    }
+  }))
+
+export const SQL_FUNCTIONS = FUNCTION_OPTIONS.map(o => o.label)
+
+/* 自定义补全源：前缀匹配函数名 */
+export function sqlFunctionCompletionSource(context) {
+  const word = context.matchBefore(/[\w$]*/)
+  if (!word || (word.from === word.to && !context.explicit)) return null
+  const prefix = word.text.toLowerCase()
+  const options = FUNCTION_OPTIONS.filter(o => o.label.startsWith(prefix))
+  return options.length ? { from: word.from, options } : null
+}
+
+/* ===== 4. 白名单过滤补全源 =====
    直接调语言自己注册的补全源（表/列/函数/关键字），只把白名单外的关键字丢掉。
    给 autocompletion({ override: [...] }) 用 —— override 会屏蔽语言自带的源，
    所以必须在这里把它们捞出来，否则表名/列名联想会一起消失。 */
@@ -87,6 +135,8 @@ function asSource(src) {
 
 export function keywordFilteredCompletionSource(context) {
   const registered = context.state.languageDataAt('autocomplete', context.pos)
+  /* 在 WHERE/ON 这类「该写列」的位置，语言源只给表名，会把列挤下去；此时把表名过滤掉 */
+  const columnMode = isColumnContext(context.state, context.pos)
   const results = []
   for (const raw of registered) {
     const src = asSource(raw)
@@ -100,7 +150,9 @@ export function keywordFilteredCompletionSource(context) {
     if (!value) continue
     /* 源可能返回单个结果，也可能返回结果数组，先统一摊平 */
     for (const result of Array.isArray(value) ? value : [value]) {
-      const options = (result.options || []).filter(isAllowedOption)
+      const options = (result.options || [])
+        .filter(isAllowedOption)
+        .filter(option => !columnMode || option.type !== 'type')
       if (options.length) results.push({ ...result, options })
     }
   }

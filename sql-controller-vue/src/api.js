@@ -127,7 +127,8 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({sql, targetDbType})
     }),
-    autocompleteSchema: () => request('/api/autocomplete/schema'),
+    // force=true 要求后端跳过缓存重查（前端不再自己存副本）
+    autocompleteSchema: (force) => request(`/api/autocomplete/schema${force ? '?force=true' : ''}`),
     schemaSnapshot: (connectionIds, force) => request('/api/diff/schema-snapshot', {
         method: 'POST',
         body: JSON.stringify({connectionIds, force: !!force}),

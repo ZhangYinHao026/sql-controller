@@ -3,7 +3,8 @@
  * 左侧「表」面板：本地 / 线上 两个根 → 连接 → 表。
  *
  * 只负责「选表」这件事：双击表把 Tab 打开（state/tableTabs），数据由 TableWorkspace 自己加载。
- * 表清单按连接懒加载；后端也按连接整份缓存（默认不过期），⟳ / 右键「刷新该库」才失效。
+ * 表清单每次展开都问后端（后端按连接缓存，命中几十毫秒），前端只留当前展示用的一份；
+ * ⟳ / 右键「刷新该库」负责让后端那份失效。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
@@ -97,7 +98,8 @@ async function loadOnline() {
 
 async function toggleConnection(connection, env) {
   connection.open = !connection.open
-  if (connection.open && !connection.tablesAt) {
+  // 每次展开都问一次后端：缓存与失效都在后端，前端不再自己判断清单新旧（命中缓存只有几十毫秒）
+  if (connection.open) {
     await loadTables(connection, env)
   }
 }
